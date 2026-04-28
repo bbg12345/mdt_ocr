@@ -17,6 +17,7 @@ from car_insurance import (
     _find_dates_in_text,
     _convert_to_iso_format,
     _extract_period_from_patterns,
+    _find_period_blocks_indices,
 )
 
 
@@ -104,10 +105,57 @@ def test_convert_to_iso_format_new_formats() -> None:
         assert result == expected, f"现有格式回归失败: {date_str}\n期望: {expected}\n实际: {result}"
 
 
+def test_extract_period_from_patterns_new_formats() -> None:
+    """测试_extract_period_from_patterns函数的新格式和现有格式"""
+
+    # 新格式测试（"保险期间："前缀格式）
+    new_format_cases = [
+        ("保险期间：2025 年 5 月 18 日 00:00 时起至 2026 年 5 月 17 日 24:00 时止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+        ("保险期间: 2025年5月18日00:00时起至2026年5月17日24:00时止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+        ("保险期间：2025年5月18日00:00起至2026年5月17日24:00止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+        ("保险期间：2025年5月18日00时起至2026年5月17日24时止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+    ]
+
+    # 现有格式回归测试（"自...起至...止"格式）
+    existing_format_cases = [
+        ("自2025年5月18日00:00时起至2026年5月17日24:00时止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+        ("自2025年5月18日00:00起至2026年5月17日24:00止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+        ("自 2025年5月18日 00:00 起 至 2026年5月17日 24:00 止",
+         {"start": "2025-05-18T00:00:00", "end": "2026-05-17T24:00:00"}),
+    ]
+
+    # 测试新格式
+    for text, expected in new_format_cases:
+        # 创建包含测试文本的块列表
+        blocks = [text]
+        # 查找保险期间块索引
+        period_blocks_indices = _find_period_blocks_indices(blocks)
+        # 调用函数
+        result = _extract_period_from_patterns(blocks, period_blocks_indices, "test_engine")
+        assert result == expected, f"新格式失败: {text}\n期望: {expected}\n实际: {result}"
+
+    # 测试现有格式
+    for text, expected in existing_format_cases:
+        # 创建包含测试文本的块列表
+        blocks = [text]
+        # 查找保险期间块索引
+        period_blocks_indices = _find_period_blocks_indices(blocks)
+        # 调用函数
+        result = _extract_period_from_patterns(blocks, period_blocks_indices, "test_engine")
+        assert result == expected, f"现有格式回归失败: {text}\n期望: {expected}\n实际: {result}"
+
+
 if __name__ == "__main__":
     try:
         test_find_dates_in_text_new_formats()
         test_convert_to_iso_format_new_formats()
+        test_extract_period_from_patterns_new_formats()
         print("✅ 所有测试通过！")
     except AssertionError as e:
         print(f"❌ 测试失败: {e}")
