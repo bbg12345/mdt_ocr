@@ -56,9 +56,58 @@ def test_find_dates_in_text_new_formats() -> None:
         assert result == expected, f"现有格式回归失败: {text}\n期望: {expected}\n实际: {result}"
 
 
+def test_convert_to_iso_format_new_formats() -> None:
+    """测试_convert_to_iso_format函数的新格式转换"""
+
+    # 新格式测试
+    new_format_cases = [
+        ("2025年5月18日00:00时", "2025-05-18T00:00:00"),
+        ("2025年5月18日00:00", "2025-05-18T00:00:00"),
+        ("2025年5月18日00时", "2025-05-18T00:00:00"),
+        ("2025-05-1800:00", "2025-05-18T00:00:00"),
+        ("2025 年 5 月 18 日 00:00 时", "2025-05-18T00:00:00"),
+        ("2025-05-18 00:00", "2025-05-18T00:00:00"),
+    ]
+
+    # 24:00:00特殊情况测试
+    special_cases = [
+        ("2026年5月17日24:00时", "2026-05-17T24:00:00"),
+        ("2026年5月17日24:00", "2026-05-17T24:00:00"),
+        ("2026年5月17日24时", "2026-05-17T24:00:00"),
+    ]
+
+    # 现有格式回归测试
+    existing_format_cases = [
+        ("2025年07月09日00时00分", "2025-07-09T00:00:00"),
+        ("2025年07月09日00时00分00秒", "2025-07-09T00:00:00"),
+        ("2025年07月09日00:00:00", "2025-07-09T00:00:00"),
+        ("2025-07-09 00:00:00", "2025-07-09T00:00:00"),
+        ("2025-07-0900:00:00", "2025-07-09T00:00:00"),
+        ("2025/07/09 00:00:00", "2025-07-09T00:00:00"),
+        ("2025年07月09日", "2025-07-09T00:00:00"),
+        ("2025-07-09", "2025-07-09T00:00:00"),
+    ]
+
+    # 测试新格式
+    for date_str, expected in new_format_cases:
+        result = _convert_to_iso_format(date_str)
+        assert result == expected, f"新格式失败: {date_str}\n期望: {expected}\n实际: {result}"
+
+    # 测试特殊情况
+    for date_str, expected in special_cases:
+        result = _convert_to_iso_format(date_str)
+        assert result == expected, f"特殊情况失败: {date_str}\n期望: {expected}\n实际: {result}"
+
+    # 测试现有格式
+    for date_str, expected in existing_format_cases:
+        result = _convert_to_iso_format(date_str)
+        assert result == expected, f"现有格式回归失败: {date_str}\n期望: {expected}\n实际: {result}"
+
+
 if __name__ == "__main__":
     try:
         test_find_dates_in_text_new_formats()
+        test_convert_to_iso_format_new_formats()
         print("✅ 所有测试通过！")
     except AssertionError as e:
         print(f"❌ 测试失败: {e}")
