@@ -1,0 +1,12 @@
+# 安装到上级共享虚拟环境: source ../venv/bin/activate && pip install -r requirements.txt
+fastapi>=0.109.0
+# 身份证/行驶证 multipart（request.form() / UploadFile）；Starlette 不自带解析器
+python-multipart>=0.0.9
+uvicorn[standard]>=0.27.0
+tencentcloud-sdk-python>=3.0.0
+pydantic>=2.0.0
+pypdf>=4.0.0
+PyMuPDF>=1.24.0
+Pillow>=10.0.0
+# test/test_insurance.py 等：pytest test/test_insurance.py -s
+pytest>=7.4.0
