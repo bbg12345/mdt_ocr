@@ -211,7 +211,7 @@ COMMERCIAL_EXPECTED_COMMERCIAL_ONLY_KV: tuple[tuple[str, ...], ...] = (
         "150000.00",
         "1528.52",
         "4座*150000元",
-        "",
+        "0",
     ),
     (  # huaan-m.pdf：无车损险明细行；三者/司机/乘客免赔额列为 0，不回填车损免赔额
         "",

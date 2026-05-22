@@ -650,6 +650,17 @@ def test_pass1_damage_deductible_from_blocks_bohai_and_zhongyin_patterns() -> No
     )
 
 
+def test_pass2_damage_deductible_from_word_items_split_bohai_field() -> None:
+    word_items = [
+        (0, 1, 38.6, 549.4, 158.6, 559.4, "车辆损失险的绝对免赔额：", 27, 0, 0),
+        (0, 2, 255.9, 548.4, 265.9, 558.4, "元", 27, 1, 0),
+        (0, 3, 211.0, 550.2, 215.1, 560.6, "0", 117, 0, 0),
+        (0, 4, 481.1, 564.5, 508.2, 574.9, "8922.32", 93, 0, 0),
+    ]
+
+    assert ci._pass2_damage_deductible_from_word_items(word_items, engine_label="test") == "0"
+
+
 def test_commercial_pass2_neighbor_blob_suggests_detail_llm() -> None:
     assert not _commercial_pass2_neighbor_blob_suggests_detail_llm("")
     assert not _commercial_pass2_neighbor_blob_suggests_detail_llm("   \n仅条款说明无数字元后缀 ")

@@ -1941,6 +1941,12 @@ _COMMERCIAL_DAMAGE_DEDUCTIBLE_FIELD_RE = re.compile(
     rf"\s*({_COMMERCIAL_MONEY_INT_RE})?{_COMMERCIAL_MONEY_OPT_FRAC_CAPTURE}\s*元",
     re.I,
 )
+_COMMERCIAL_DAMAGE_DEDUCTIBLE_LABEL_RE = re.compile(
+    r"(?:车\s*损\s*险|车辆\s*损失\s*险)\s*(?:每\s*次\s*事故|的)?\s*绝对\s*免赔\s*额",
+    re.I,
+)
+_COMMERCIAL_DAMAGE_DEDUCTIBLE_WORD_Y_PAD_PT: Final[float] = 4.0
+_COMMERCIAL_DAMAGE_DEDUCTIBLE_WORD_X_RIGHT_PT: Final[float] = 180.0
 
 
 def _pass1_damage_deductible_from_blocks(
@@ -1977,6 +1983,64 @@ def _pass1_damage_deductible_from_blocks(
         )
         return "0"
     return None
+
+
+def _pass2_damage_deductible_from_word_items(
+    word_items: Sequence[Tuple[int, int, float, float, float, float, str, int, int, int]],
+    *,
+    engine_label: str,
+) -> Optional[str]:
+    for wi, (page, _word_idx, x0, y0, x1, y1, text, *_meta) in enumerate(word_items):
+        if not _COMMERCIAL_DAMAGE_DEDUCTIBLE_LABEL_RE.search(text or ""):
+            continue
+        row_words: List[Tuple[float, str]] = []
+        for page2, _word_idx2, wx0, wy0, wx1, wy1, wtext, *_meta2 in word_items:
+            if page2 != page:
+                continue
+            if wy1 < y0 - _COMMERCIAL_DAMAGE_DEDUCTIBLE_WORD_Y_PAD_PT:
+                continue
+            if wy0 > y1 + _COMMERCIAL_DAMAGE_DEDUCTIBLE_WORD_Y_PAD_PT:
+                continue
+            if wx1 < x0 - _PREMIUM_BBOX_REL_X0_EPS_PT:
+                continue
+            if wx0 > x1 + _COMMERCIAL_DAMAGE_DEDUCTIBLE_WORD_X_RIGHT_PT:
+                continue
+            if wtext:
+                row_words.append((wx0, str(wtext)))
+        row_words.sort(key=lambda t: t[0])
+        row_text = " ".join(t for _x, t in row_words)
+        m = _COMMERCIAL_DAMAGE_DEDUCTIBLE_FIELD_RE.search(row_text)
+        if not m or not m.group(1):
+            continue
+        v = _commercial_money_from_int_frac(m.group(1), m.group(2))
+        if v is None:
+            continue
+        _log_pass(
+            engine_label,
+            PREMIUM_DETAIL_EXTRACTION_STATE,
+            2,
+            "明细 车损免赔额词级bbox=%r word_index=%s row_text=%r",
+            v,
+            wi,
+            row_text,
+        )
+        return v
+    return None
+
+
+def _pass2_damage_deductible_with_bbox_fallback(
+    pdf_bytes: bytes,
+    *,
+    engine_label: str = "pymupdf",
+) -> Optional[str]:
+    try:
+        word_items = iter_pymupdf_word_rect_items(pdf_bytes)
+    except ImportError:
+        return None
+    return _pass2_damage_deductible_from_word_items(
+        word_items,
+        engine_label=engine_label,
+    )
 
 
 def _merge_commercial_detail_table_kv(
@@ -3489,7 +3553,12 @@ def car_insurance_extract(
             engine_label="pypdf",
             empty_as_zero=empty_as_zero,
         )
-        ded = ded_mu or ded_pdf or ""
+        ded = ded_mu or ded_pdf
+        if not ded:
+            ded = _pass2_damage_deductible_with_bbox_fallback(
+                pdf_bytes,
+                engine_label="pymupdf",
+            )
         if ded:
             kv["免赔额"] = ded
 
