@@ -6,6 +6,8 @@ uvicorn[standard]>=0.27.0
 tencentcloud-sdk-python>=3.0.0
 pydantic>=2.0.0
 pypdf>=4.0.0
+# pypdf 读 AES 加密 PDF 时需要（空用户密码的权限加密保单常见）
+cryptography>=3.1
 PyMuPDF>=1.24.0
 Pillow>=10.0.0
 # test/test_insurance.py 等：pytest test/test_insurance.py -s
