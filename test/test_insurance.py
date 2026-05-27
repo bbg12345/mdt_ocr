@@ -197,6 +197,40 @@ COMMERCIAL_EXPECTED_PREMIUM_TOTALS: tuple[str, ...] = (
     "2850.07",  # new/renshou-m.pdf（本地）
 )
 
+# 与 ``COMMERCIAL_INSURANCE_PDF_URLS`` 同序：期望 ``kv["车牌号"]``
+COMMERCIAL_EXPECTED_LICENSE_PLATE_NUMBERS: tuple[str, ...] = (
+    "津D205710",  # bohai-m.PDF
+    "津AAY1756",  # huaan-m.pdf
+    "津A-AM8718",  # pingan-m.pdf
+    "津AAA9466",  # renmin-m.pdf
+    "津ABP3526",  # renshou-m.pdf
+    "",  # renshou-m2.pdf
+    "津ADJ1786",  # taikang-m.pdf
+    "津ADR0108",  # taipingyang-m.pdf
+    "津AAU2918",  # yanguang-m.pdf
+    "津AAU7197",  # zhongyin-m.pdf
+    "津ADZ2569",  # new/bohai-m.pdf（本地）
+    "津ADH1055",  # new/renmin-m.pdf（本地）
+    "津AD43586",  # new/renshou-m.pdf（本地）
+)
+
+# 与 ``COMMERCIAL_INSURANCE_PDF_URLS`` 同序：期望 ``kv["车架号"]``
+COMMERCIAL_EXPECTED_VINS: tuple[str, ...] = (
+    "LNBMC5GK8SD205710",  # bohai-m.PDF
+    "LUZBGBFB5PA104918",  # huaan-m.pdf
+    "LFMAS14U2P0006679",  # pingan-m.pdf
+    "LLV5CWB25S0305141",  # renmin-m.pdf
+    "HACAALA12S1B18390",  # renshou-m.pdf
+    "LNBSC1AK9SR240932",  # renshou-m2.pdf
+    "LNBSCC4H4KD799801",  # taikang-m.pdf
+    "LNBSCC4H8KW264202",  # taipingyang-m.pdf
+    "LUZBGBFA6PA119998",  # yanguang-m.pdf
+    "LNAAKAA10P5764849",  # zhongyin-m.pdf
+    "LB378Y4W0MA131827",  # new/bohai-m.pdf（本地）
+    "LNAA2AA12K5030982",  # new/renmin-m.pdf（本地）
+    "LNBSCC4HXKD107539",  # new/renshou-m.pdf（本地）
+)
+
 # 与 ``COMMERCIAL_INSURANCE_PDF_URLS`` 同序：商业险专属键期望，每行 9 项对应
 # ``_CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS`` 顺序。
 # 未命中承保险种锚点、或无法从原文解析时一律 ``""``（不再用人保/太平洋版式补 ``0``）；
@@ -453,17 +487,51 @@ COMPULSORY_EXPECTED_PREMIUM_TOTALS: tuple[str, ...] = (
     "1170.00",  # new/renshou-f.pdf（本地）
 )
 
+# 与 ``COMPULSORY_INSURANCE_PDF_URLS`` 同序：期望 ``kv["车牌号"]``
+COMPULSORY_EXPECTED_LICENSE_PLATE_NUMBERS: tuple[str, ...] = (
+    "津D205710",  # bohai-f.PDF
+    "津A-AM8718",  # pingan-f.pdf
+    "津AAY1756",  # renmin-f-2.pdf
+    "津AAU2918",  # renmin-f-3.pdf
+    "L1204F",  # renmin-f-4.pdf
+    "631PF4",  # renmin-f.pdf
+    "",  # renshou-f.pdf
+    "津ADJ1786",  # taikang-f.pdf
+    "津ADR0108",  # taipingyang-f-insurance.pdf
+    "津AAU7197",  # zhongyin-f.pdf
+    "津AD43586",  # new/renshou-f.pdf（本地）
+)
+
+# 与 ``COMPULSORY_INSURANCE_PDF_URLS`` 同序：期望 ``kv["车架号"]``
+COMPULSORY_EXPECTED_VINS: tuple[str, ...] = (
+    "LNBMC5GK8SD205710",  # bohai-f.PDF
+    "LFMAS14U2P0006679",  # pingan-f.pdf
+    "LUZBGBFB5PA104918",  # renmin-f-2.pdf
+    "LUZBGBFA6PA119998",  # renmin-f-3.pdf
+    "LLV5CWB25S0305141",  # renmin-f-4.pdf
+    "HACAALA12S1B18390",  # renmin-f.pdf
+    "LNBSC1AK9SR240932",  # renshou-f.pdf
+    "LNBSCC4H4KD799801",  # taikang-f.pdf
+    "LNBSCC4H8KW264202",  # taipingyang-f-insurance.pdf
+    "LNAAKAA10P5764849",  # zhongyin-f.pdf
+    "LNBSCC4HXKD107539",  # new/renshou-f.pdf（本地）
+)
+
 assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_INSURER_NAMES)
 assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_PERIODS)
 assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_INSURED_NAMES)
 assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_SIGN_DATES)
 assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_PREMIUM_TOTALS)
+assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_LICENSE_PLATE_NUMBERS)
+assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(COMPULSORY_EXPECTED_VINS)
 assert len(COMPULSORY_INSURANCE_PDF_URLS) == len(_COMPULSORY_INSURANCE_PDF_PYTEST_IDS)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_INSURER_NAMES)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_PERIODS)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_INSURED_NAMES)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_SIGN_DATES)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_PREMIUM_TOTALS)
+assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_LICENSE_PLATE_NUMBERS)
+assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_VINS)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(COMMERCIAL_EXPECTED_COMMERCIAL_ONLY_KV)
 assert len(COMMERCIAL_INSURANCE_PDF_URLS) == len(_COMMERCIAL_INSURANCE_PDF_PYTEST_IDS)
 assert len(_CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS) == 9
@@ -563,7 +631,7 @@ def _print_case_done(tag: str, i: int, n: int) -> None:
 
 @pytest.mark.parametrize(
     "url,expected_name,expected_period,expected_insured_name,"
-    "expected_sign_date,expected_premium_total",
+    "expected_sign_date,expected_premium_total,expected_license_plate_number,expected_vin",
     list(
         zip(
             COMPULSORY_INSURANCE_PDF_URLS,
@@ -572,6 +640,8 @@ def _print_case_done(tag: str, i: int, n: int) -> None:
             COMPULSORY_EXPECTED_INSURED_NAMES,
             COMPULSORY_EXPECTED_SIGN_DATES,
             COMPULSORY_EXPECTED_PREMIUM_TOTALS,
+            COMPULSORY_EXPECTED_LICENSE_PLATE_NUMBERS,
+            COMPULSORY_EXPECTED_VINS,
         )
     ),
     ids=list(_COMPULSORY_INSURANCE_PDF_PYTEST_IDS),
@@ -583,6 +653,8 @@ def test_car_insurance_compulsory_extract(
     expected_insured_name: str,
     expected_sign_date: str,
     expected_premium_total: str,
+    expected_license_plate_number: str,
+    expected_vin: str,
 ) -> None:
     """交强险：单个PDF文件测试用例。"""
     # 处理COMPULSORY_RUN_INDICES过滤（向后兼容）
@@ -631,10 +703,21 @@ def test_car_insurance_compulsory_extract(
             f"保险费合计不匹配: 期望={expected_premium_total!r}, 实际={got_premium!r}, url={url}"
         )
 
+    got_license_plate_number = result["kv"].get("车牌号")
+    if got_license_plate_number != expected_license_plate_number:
+        pytest.fail(
+            f"车牌号不匹配: 期望={expected_license_plate_number!r}, 实际={got_license_plate_number!r}, url={url}"
+        )
+
+    got_vin = result["kv"].get("车架号")
+    if got_vin != expected_vin:
+        pytest.fail(f"车架号不匹配: 期望={expected_vin!r}, 实际={got_vin!r}, url={url}")
+
 
 @pytest.mark.parametrize(
     "url,expected_name,expected_period,expected_insured_name,"
-    "expected_sign_date,expected_premium_total,expected_commercial_only",
+    "expected_sign_date,expected_premium_total,expected_license_plate_number,"
+    "expected_vin,expected_commercial_only",
     list(
         zip(
             COMMERCIAL_INSURANCE_PDF_URLS,
@@ -643,6 +726,8 @@ def test_car_insurance_compulsory_extract(
             COMMERCIAL_EXPECTED_INSURED_NAMES,
             COMMERCIAL_EXPECTED_SIGN_DATES,
             COMMERCIAL_EXPECTED_PREMIUM_TOTALS,
+            COMMERCIAL_EXPECTED_LICENSE_PLATE_NUMBERS,
+            COMMERCIAL_EXPECTED_VINS,
             COMMERCIAL_EXPECTED_COMMERCIAL_ONLY_KV,
         )
     ),
@@ -655,6 +740,8 @@ def test_car_insurance_commercial_extract(
     expected_insured_name: str,
     expected_sign_date: str,
     expected_premium_total: str,
+    expected_license_plate_number: str,
+    expected_vin: str,
     expected_commercial_only: tuple[str, ...],
 ) -> None:
     """商业险：单个PDF文件测试用例。"""
@@ -713,6 +800,16 @@ def test_car_insurance_commercial_extract(
         errs.append(
             f"保险费合计不匹配: 期望={expected_premium_total!r}, 实际={got_premium!r}, url={url}"
         )
+
+    got_license_plate_number = kv.get("车牌号")
+    if got_license_plate_number != expected_license_plate_number:
+        errs.append(
+            f"车牌号不匹配: 期望={expected_license_plate_number!r}, 实际={got_license_plate_number!r}, url={url}"
+        )
+
+    got_vin = kv.get("车架号")
+    if got_vin != expected_vin:
+        errs.append(f"车架号不匹配: 期望={expected_vin!r}, 实际={got_vin!r}, url={url}")
 
     expected_only_map = dict(zip(_CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS, expected_commercial_only))
     for k, ev in expected_only_map.items():

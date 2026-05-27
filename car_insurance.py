@@ -47,6 +47,8 @@ ExtractionState = Literal[
     "保险公司抽取",
     "保险期间抽取",
     "被保人抽取",
+    "车牌号抽取",
+    "车架号抽取",
     "签单日期抽取",
     "保险费合计抽取",
     "保险费明细抽取",
@@ -55,6 +57,8 @@ ExtractionState = Literal[
 INSURER_EXTRACTION_STATE: ExtractionState = "保险公司抽取"
 PERIOD_EXTRACTION_STATE: ExtractionState = "保险期间抽取"
 INSURED_EXTRACTION_STATE: ExtractionState = "被保人抽取"
+LICENSE_PLATE_EXTRACTION_STATE: ExtractionState = "车牌号抽取"
+VIN_EXTRACTION_STATE: ExtractionState = "车架号抽取"
 SIGN_DATE_EXTRACTION_STATE: ExtractionState = "签单日期抽取"
 PREMIUM_TOTAL_EXTRACTION_STATE: ExtractionState = "保险费合计抽取"
 PREMIUM_DETAIL_EXTRACTION_STATE: ExtractionState = "保险费明细抽取"
@@ -80,6 +84,8 @@ _CAR_INSURANCE_COMMON_KV_KEYS: tuple[str, ...] = (
     "保险公司名称",
     "签单日期",
     "保险费合计",
+    "车牌号",
+    "车架号",
 )
 _CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS: tuple[str, ...] = (
     "新能源汽车损失保险保费",
@@ -888,6 +894,274 @@ def run_car_insurance_insured_passes(
         "pass2_block_index": pass2_block_idx,
         "被保险人": insured_display,
     }
+
+
+_KEYED_TOKEN_LEADING_PUNCT_RE = re.compile(r"^[：:：,，;；、)）\]】]+")
+_KEYED_TOKEN_SPLIT_RE = re.compile(r"[ \t\r\n]+")
+_LICENSE_PLATE_RE = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9-]+$")
+_VIN_RE = re.compile(r"^[A-Za-z0-9]+$")
+_KEYED_TOKEN_BBOX_Y_TOLERANCE_PT = 10.0
+
+
+def _find_keyword_end_tolerant(text: str, keyword: str, *, start: int = 0) -> Optional[Tuple[int, int]]:
+    i = start
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        if text[i] != keyword[0]:
+            i += 1
+            continue
+
+        j = i + 1
+        ki = 1
+        while ki < len(keyword):
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j >= len(text) or text[j] != keyword[ki]:
+                break
+            j += 1
+            ki += 1
+        if ki == len(keyword):
+            return i, j
+        i += 1
+    return None
+
+
+def _next_space_or_tab_delimited_token_after_keyword(block: str, keyword: str) -> Optional[str]:
+    pos = 0
+    while True:
+        hit = _find_keyword_end_tolerant(block, keyword, start=pos)
+        if hit is None:
+            return None
+        _idx, tail_start = hit
+        if tail_start < len(block) and block[tail_start] == "码":
+            tail_start += 1
+        tail = block[tail_start:].lstrip()
+        tail = _KEYED_TOKEN_LEADING_PUNCT_RE.sub("", tail).lstrip()
+        if tail:
+            token = _KEYED_TOKEN_SPLIT_RE.split(tail, maxsplit=1)[0].strip()
+            token = token.strip("，。；;、:：()（）[]【】")
+            if token:
+                return token
+        pos = tail_start
+
+
+def _license_plate_token_passes(token: str) -> bool:
+    has_chinese = any(_is_chinese_char(ch) for ch in token)
+    return (
+        bool(token)
+        and len(token) <= 9
+        and bool(_LICENSE_PLATE_RE.fullmatch(token))
+        and any(ch.isascii() and ch.isalpha() for ch in token)
+        and any(ch.isascii() and ch.isdigit() for ch in token)
+        and (
+            not has_chinese
+            or (_is_chinese_char(token[0]) and not any(_is_chinese_char(ch) for ch in token[1:]))
+        )
+    )
+
+
+def _vin_token_passes(token: str) -> bool:
+    return (
+        bool(token)
+        and bool(_VIN_RE.fullmatch(token))
+        and any(ch.isalpha() for ch in token)
+        and any(ch.isdigit() for ch in token)
+    )
+
+
+def _pass1_keyed_token_from_block(
+    block: str,
+    *,
+    keyword: str,
+    validator: Callable[[str], bool],
+) -> Optional[str]:
+    token = _next_space_or_tab_delimited_token_after_keyword(block, keyword)
+    if token is None:
+        return None
+    return token if validator(token) else None
+
+
+def _pass1_keyed_token_from_block_any_keyword(
+    block: str,
+    *,
+    keywords: Sequence[str],
+    validator: Callable[[str], bool],
+) -> Optional[str]:
+    for keyword in keywords:
+        v = _pass1_keyed_token_from_block(
+            block,
+            keyword=keyword,
+            validator=validator,
+        )
+        if v is not None:
+            return v
+    return None
+
+
+def _valid_whole_pattern_text(
+    text: str,
+    *,
+    token_re: re.Pattern[str],
+    validator: Callable[[str], bool],
+) -> Optional[str]:
+    token = re.sub(r"\s+", "", text).strip("，。；;、:：()（）[]【】")
+    if not token_re.fullmatch(token):
+        return None
+    return token if validator(token) else None
+
+
+def _pass2_keyed_token_with_bbox(
+    pdf_bytes: bytes,
+    *,
+    keywords: Sequence[str],
+    token_re: re.Pattern[str],
+    validator: Callable[[str], bool],
+    engine_label: str,
+    output_key: str,
+) -> Optional[str]:
+    try:
+        words = iter_pymupdf_word_rect_items(pdf_bytes)
+    except Exception:
+        return None
+
+    ref = next(
+        (
+            w
+            for w in words
+            if any(_find_keyword_end_tolerant(w[6], keyword) is not None for keyword in keywords)
+        ),
+        None,
+    )
+    if ref is None:
+        logger.debug("[%s] %s bbox pass2：未找到关键字word keywords=%r", engine_label, output_key, keywords)
+        return None
+
+    ref_page, ref_wi, ref_x0, ref_y0, ref_x1, ref_y1, ref_text, _ref_bn, _ref_ln, _ref_wn = ref
+    logger.debug(
+        "[%s] %s bbox pass2：参考word page=%s wi=%s x0=%.2f x1=%.2f y0=%.2f y1=%.2f text=%r",
+        engine_label,
+        output_key,
+        ref_page,
+        ref_wi,
+        ref_x0,
+        ref_x1,
+        ref_y0,
+        ref_y1,
+        ref_text,
+    )
+
+    candidates: List[Tuple[float, float, int, str]] = []
+    for page_index, wi, x0, y0, x1, y1, text, _bn, _ln, _wn in words:
+        if page_index != ref_page:
+            continue
+        if _rects_close(x0, y0, x1, y1, ref_x0, ref_y0, ref_x1, ref_y1):
+            continue
+        if y0 < ref_y0 - _KEYED_TOKEN_BBOX_Y_TOLERANCE_PT:
+            continue
+        if y1 > ref_y1 + _KEYED_TOKEN_BBOX_Y_TOLERANCE_PT:
+            continue
+        if x0 < ref_x0:
+            continue
+        candidates.append((x0, y0, wi, text))
+
+    for _x0, _y0, _wi, text in sorted(candidates, key=lambda row: (row[0], row[1], row[2])):
+        v = _valid_whole_pattern_text(
+            text,
+            token_re=token_re,
+            validator=validator,
+        )
+        if v is not None:
+            logger.debug("[%s] %s bbox pass2 word纵带从key起始x向右命中：%r", engine_label, output_key, v)
+            return v
+
+    logger.debug("[%s] %s bbox pass2：word纵向条带key右侧候选未命中", engine_label, output_key)
+    return None
+
+
+def run_car_insurance_keyed_token_passes(
+    blocks: Sequence[str],
+    *,
+    engine_label: str,
+    output_key: str,
+    keyword: str | Sequence[str],
+    token_re: re.Pattern[str],
+    validator: Callable[[str], bool],
+    state: ExtractionState,
+    pdf_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
+    keywords = (keyword,) if isinstance(keyword, str) else tuple(keyword)
+    pass1_hit: Optional[str] = None
+    pass1_block_idx: Optional[int] = None
+    for bi, block in enumerate(blocks):
+        v = _pass1_keyed_token_from_block_any_keyword(
+            block,
+            keywords=keywords,
+            validator=validator,
+        )
+        if v is not None:
+            pass1_hit = v
+            pass1_block_idx = bi
+            _log_pass(engine_label, state, 1, "命中：%s=%r block_index=%s", output_key, v, bi)
+            break
+
+    pass2_hit: Optional[str] = None
+    if pass1_hit is None and pdf_bytes is not None:
+        pass2_hit = _pass2_keyed_token_with_bbox(
+            pdf_bytes,
+            keywords=keywords,
+            token_re=token_re,
+            validator=validator,
+            engine_label=engine_label,
+            output_key=output_key,
+        )
+        if pass2_hit is not None:
+            _log_pass(engine_label, state, 2, "bbox条带命中：%s=%r", output_key, pass2_hit)
+
+    display = pass1_hit or pass2_hit
+    return {
+        "pass1_hit": pass1_hit,
+        "pass1_block_index": pass1_block_idx,
+        "pass2_hit": pass2_hit,
+        output_key: display,
+    }
+
+
+def run_car_insurance_license_plate_passes(
+    blocks: Sequence[str],
+    *,
+    engine_label: str,
+    pdf_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
+    return run_car_insurance_keyed_token_passes(
+        blocks,
+        engine_label=engine_label,
+        output_key="车牌号",
+        keyword=("号牌号码", "车牌号", "号码号牌"),
+        token_re=re.compile(r"[\u4e00-\u9fffA-Za-z0-9-]+"),
+        validator=_license_plate_token_passes,
+        state=LICENSE_PLATE_EXTRACTION_STATE,
+        pdf_bytes=pdf_bytes,
+    )
+
+
+def run_car_insurance_vin_passes(
+    blocks: Sequence[str],
+    *,
+    engine_label: str,
+    pdf_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
+    return run_car_insurance_keyed_token_passes(
+        blocks,
+        engine_label=engine_label,
+        output_key="车架号",
+        keyword="车架号",
+        token_re=re.compile(r"[A-Za-z0-9]+"),
+        validator=_vin_token_passes,
+        state=VIN_EXTRACTION_STATE,
+        pdf_bytes=pdf_bytes,
+    )
 
 
 _SIGN_DATE_KEY_RE = re.compile(r"签单日期\s*[：:]")
@@ -3426,6 +3700,7 @@ def car_insurance_extract(
     """
     pdf_bytes = load_pdf_bytes(pdf_url)
     blocks_pdf = flatten_pypdf_blocks(pdf_bytes)
+    page_texts_pdf = extract_pypdf_page_texts(pdf_bytes)
     blocks_mu = iter_pymupdf_text_blocks(pdf_bytes)
 
     is_commercial = _policy_type_is_commercial(policy_type)
@@ -3442,6 +3717,18 @@ def car_insurance_extract(
     )
     insured_pdf = run_car_insurance_insured_passes(blocks_pdf, engine_label="pypdf")
     insured_mu = run_car_insurance_insured_passes(blocks_mu, engine_label="pymupdf")
+    license_plate_pdf = run_car_insurance_license_plate_passes(page_texts_pdf, engine_label="pypdf")
+    license_plate_mu = run_car_insurance_license_plate_passes(
+        blocks_mu,
+        engine_label="pymupdf",
+        pdf_bytes=pdf_bytes,
+    )
+    vin_pdf = run_car_insurance_vin_passes(page_texts_pdf, engine_label="pypdf")
+    vin_mu = run_car_insurance_vin_passes(
+        blocks_mu,
+        engine_label="pymupdf",
+        pdf_bytes=pdf_bytes,
+    )
     sign_date_pdf = run_car_insurance_sign_date_passes(
         blocks_pdf,
         engine_label="pypdf",
@@ -3498,6 +3785,8 @@ def car_insurance_extract(
     kv["被保险人"] = (insured_mu.get("被保险人") or insured_pdf.get("被保险人")) or ""
     kv["签单日期"] = (sign_date_mu.get("签单日期") or sign_date_pdf.get("签单日期")) or ""
     kv["保险费合计"] = (premium_mu.get("保险费合计") or premium_pdf.get("保险费合计")) or ""
+    kv["车牌号"] = (license_plate_mu.get("车牌号") or license_plate_pdf.get("车牌号")) or ""
+    kv["车架号"] = (vin_mu.get("车架号") or vin_pdf.get("车架号")) or ""
 
     # 提取保险期间
     period_pdf = extract_insurance_period_from_blocks(blocks_pdf, engine_label="pypdf")

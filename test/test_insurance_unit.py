@@ -30,6 +30,8 @@ from car_insurance import (
     _find_period_blocks_indices,
     _pass2_insured_name_from_block,
     run_car_insurance_insured_passes,
+    run_car_insurance_license_plate_passes,
+    run_car_insurance_vin_passes,
     _pass1_sign_date_from_block,
     run_car_insurance_sign_date_passes,
     _pass1_premium_total_from_block,
@@ -223,6 +225,204 @@ def test_pass2_insured_name_from_block_mdt_company() -> None:
     block = "投保人： 天津明德通汽车租赁有限公司 保单号：123"
     got = _pass2_insured_name_from_block(block)
     assert got == "天津明德通汽车租赁有限公司"
+
+
+def test_run_car_insurance_license_plate_passes_pass1() -> None:
+    blocks = [
+        "其他信息",
+        "号牌号码 津A-AM8718 车架号 LFMAS14U2P0006679",
+    ]
+    got = run_car_insurance_license_plate_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] == "津A-AM8718"
+    assert got["pass1_block_index"] == 1
+    assert got["车牌号"] == "津A-AM8718"
+
+
+def test_run_car_insurance_license_plate_passes_pass1_newline_delimited() -> None:
+    blocks = [
+        "号牌号码\n津AAY1756\n机动车种类\n客车\n使用性质\n出租、租赁营业客车",
+    ]
+    got = run_car_insurance_license_plate_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] == "津AAY1756"
+    assert got["车牌号"] == "津AAY1756"
+
+
+def test_run_car_insurance_license_plate_passes_pass1_car_plate_key() -> None:
+    blocks = [
+        "车牌号\n津ADJ1786\n厂牌型号\n北京BJ7000C5D3-BEV",
+    ]
+    got = run_car_insurance_license_plate_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] == "津ADJ1786"
+    assert got["车牌号"] == "津ADJ1786"
+
+
+def test_run_car_insurance_license_plate_passes_pass2_reversed_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    word_items = [
+        (0, 8, 97.0, 198.3, 136.1, 206.9, "号码号牌", 6, 0, 0),
+        (0, 9, 169.4, 197.8, 214.1, 208.2, "津AAU7197", 7, 0, 0),
+    ]
+    monkeypatch.setattr(ci, "iter_pymupdf_word_rect_items", lambda _pdf_bytes: word_items)
+
+    got = run_car_insurance_license_plate_passes(
+        ["无关块"],
+        engine_label="test_engine",
+        pdf_bytes=b"pdf",
+    )
+    assert got["pass1_hit"] is None
+    assert got["pass2_hit"] == "津AAU7197"
+    assert got["车牌号"] == "津AAU7197"
+
+
+def test_run_car_insurance_license_plate_passes_pass1_spaced_keyword() -> None:
+    blocks = [
+        "号 牌 号 码津ADR0108\n机动车种类\n6座以下客车",
+    ]
+    got = run_car_insurance_license_plate_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] == "津ADR0108"
+    assert got["车牌号"] == "津ADR0108"
+
+
+def test_run_car_insurance_license_plate_passes_rejects_invalid_token() -> None:
+    blocks = ["号牌号码 号牌号码 车架号 LFMAS14U2P0006679"]
+    got = run_car_insurance_license_plate_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] is None
+    assert got["车牌号"] is None
+
+
+def test_run_car_insurance_license_plate_passes_pass2_word_bbox_scans_right_from_key_x0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    word_items = [
+        (0, 1, 100.0, 100.0, 150.0, 120.0, "号牌号码", 1, 0, 0),
+        (0, 2, 20.0, 101.0, 80.0, 119.0, "津B99999", 2, 0, 0),
+        (0, 3, 170.0, 101.0, 240.0, 119.0, "津A12345", 3, 0, 0),
+    ]
+    monkeypatch.setattr(ci, "iter_pymupdf_word_rect_items", lambda _pdf_bytes: word_items)
+
+    got = run_car_insurance_license_plate_passes(
+        ["无关块"],
+        engine_label="test_engine",
+        pdf_bytes=b"pdf",
+    )
+    assert got["pass1_hit"] is None
+    assert got["pass2_hit"] == "津A12345"
+    assert got["车牌号"] == "津A12345"
+
+
+def test_run_car_insurance_license_plate_passes_pass2_bbox_uses_overlap_after_right_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    word_items = [
+        (0, 1, 90.0, 240.0, 126.0, 249.0, "号牌号码", 1, 0, 0),
+        (0, 2, 503.0, 224.0, 552.0, 233.0, "156****6337", 2, 0, 0),
+        (0, 3, 145.0, 240.0, 186.0, 250.0, "津D205710", 3, 0, 0),
+    ]
+    monkeypatch.setattr(ci, "iter_pymupdf_word_rect_items", lambda _pdf_bytes: word_items)
+
+    got = run_car_insurance_license_plate_passes(
+        ["无关块"],
+        engine_label="test_engine",
+        pdf_bytes=b"pdf",
+    )
+    assert got["pass1_hit"] is None
+    assert got["pass2_hit"] == "津D205710"
+    assert got["车牌号"] == "津D205710"
+
+
+def test_run_car_insurance_license_plate_passes_pass2_rejects_chinese_unit_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    word_items = [
+        (0, 1, 68.0, 200.3, 104.0, 210.0, "号牌号码", 1, 0, 0),
+        (0, 2, 468.3, 252.4, 492.9, 264.0, "0千克", 2, 0, 0),
+        (0, 3, 147.5, 211.4, 197.2, 219.9, "津AAU7197", 3, 0, 0),
+    ]
+    monkeypatch.setattr(ci, "iter_pymupdf_word_rect_items", lambda _pdf_bytes: word_items)
+
+    got = run_car_insurance_license_plate_passes(
+        ["无关块"],
+        engine_label="test_engine",
+        pdf_bytes=b"pdf",
+    )
+    assert got["pass1_hit"] is None
+    assert got["pass2_hit"] == "津AAU7197"
+    assert got["车牌号"] == "津AAU7197"
+
+
+def test_run_car_insurance_license_plate_passes_rejects_too_long_plate() -> None:
+    blocks = ["号牌号码 津ADR010189"]
+    got = run_car_insurance_license_plate_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] is None
+    assert got["车牌号"] is None
+
+
+def test_run_car_insurance_vin_passes_pass1_colon_variant() -> None:
+    blocks = [
+        "其他信息",
+        "车架号： LNBMC5GK8SD205710 发动机号 ABC123",
+    ]
+    got = run_car_insurance_vin_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] == "LNBMC5GK8SD205710"
+    assert got["pass1_block_index"] == 1
+    assert got["车架号"] == "LNBMC5GK8SD205710"
+
+
+def test_run_car_insurance_vin_passes_pass1_after_closing_parenthesis() -> None:
+    blocks = [
+        "发动机号码\nB123004208\n识别代码(车架号) LFMAS14U2P0006679",
+    ]
+    got = run_car_insurance_vin_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] == "LFMAS14U2P0006679"
+    assert got["车架号"] == "LFMAS14U2P0006679"
+
+
+def test_run_car_insurance_vin_passes_requires_letters_and_digits() -> None:
+    blocks = ["车架号 1234567890 其他"]
+    got = run_car_insurance_vin_passes(blocks, engine_label="test_engine")
+    assert got["pass1_hit"] is None
+    assert got["车架号"] is None
+
+
+def test_run_car_insurance_vin_passes_pass2_ignores_left_of_key_x0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    word_items = [
+        (0, 1, 100.0, 100.0, 150.0, 120.0, "车架号", 1, 0, 0),
+        (0, 2, 170.0, 101.0, 240.0, 119.0, "1234567890", 2, 0, 0),
+        (0, 3, 20.0, 101.0, 80.0, 119.0, "LFMAS14U2P0006679", 3, 0, 0),
+    ]
+    monkeypatch.setattr(ci, "iter_pymupdf_word_rect_items", lambda _pdf_bytes: word_items)
+
+    got = run_car_insurance_vin_passes(
+        ["无关块"],
+        engine_label="test_engine",
+        pdf_bytes=b"pdf",
+    )
+    assert got["pass1_hit"] is None
+    assert got["pass2_hit"] is None
+    assert got["车架号"] is None
+
+
+def test_run_car_insurance_vin_passes_pass2_uses_keyword_word_bbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    word_items = [
+        (0, 16, 239.0, 252.1, 359.3, 262.1, "VIN/车架号", 3, 1, 0),
+        (0, 17, 147.5, 233.5, 218.5, 245.1, "A2003P624CB035", 4, 0, 0),
+        (0, 18, 294.2, 252.5, 388.1, 264.1, "LNAAKAA10P5764849", 5, 0, 0),
+    ]
+    monkeypatch.setattr(ci, "iter_pymupdf_word_rect_items", lambda _pdf_bytes: word_items)
+
+    got = run_car_insurance_vin_passes(
+        ["无关块"],
+        engine_label="test_engine",
+        pdf_bytes=b"pdf",
+    )
+    assert got["pass1_hit"] is None
+    assert got["pass2_hit"] == "LNAAKAA10P5764849"
+    assert got["车架号"] == "LNAAKAA10P5764849"
 
 
 def test_pass1_sign_date_from_block_colon_variants() -> None:
