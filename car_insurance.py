@@ -2825,6 +2825,7 @@ class CommercialPass2Pass2TableConfig:
     detail_column_indices: Tuple[int, ...]
     detail_json_field_keys: Tuple[str, ...]
     detail_role_cn: Tuple[str, ...]
+    extra_header_column_indices: Tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.header_texts_in_column_order) != len(self.column_indices):
@@ -2846,7 +2847,11 @@ class CommercialPass2Pass2TableConfig:
         return ""
 
     def filtered_header_pairs_for_extract_table(self) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
-        keep = frozenset(self.detail_column_indices) | {self.key_column_index}
+        keep = (
+            frozenset(self.detail_column_indices)
+            | frozenset(self.extra_header_column_indices)
+            | {self.key_column_index}
+        )
         texts: List[str] = []
         cols: List[int] = []
         for t, c in zip(self.header_texts_in_column_order, self.column_indices):
@@ -2857,7 +2862,11 @@ class CommercialPass2Pass2TableConfig:
 
     def auxiliary_header_texts_not_in_extract(self) -> Tuple[str, ...]:
         """全表中未进入 ``extract_table`` 的表头子串（「仅作列对齐参考」一句）。"""
-        keep = frozenset(self.detail_column_indices) | {self.key_column_index}
+        keep = (
+            frozenset(self.detail_column_indices)
+            | frozenset(self.extra_header_column_indices)
+            | {self.key_column_index}
+        )
         return tuple(
             t for t, c in zip(self.header_texts_in_column_order, self.column_indices) if c not in keep
         )
@@ -2878,6 +2887,7 @@ _COMMERCIAL_PASS2_BOHAI_PASS2_TABLE_CONFIG = CommercialPass2Pass2TableConfig(
     detail_column_indices=(3, 5),
     detail_json_field_keys=("coverage", "premium"),
     detail_role_cn=("保额", "保费"),
+    extra_header_column_indices=(2, 4),
 )
 
 _COMMERCIAL_PASS2_ZHONGYIN_PASS2_TABLE_CONFIG = CommercialPass2Pass2TableConfig(
@@ -2889,6 +2899,7 @@ _COMMERCIAL_PASS2_ZHONGYIN_PASS2_TABLE_CONFIG = CommercialPass2Pass2TableConfig(
     detail_column_indices=(2, 4),
     detail_json_field_keys=("coverage", "premium"),
     detail_role_cn=("保额", "保费"),
+    extra_header_column_indices=(3,),
 )
 
 _COMMERCIAL_PASS2_HUAAN_PASS2_TABLE_CONFIG = CommercialPass2Pass2TableConfig(
@@ -3336,13 +3347,23 @@ def _doubao_infer_commercial_detail_row(
         row_label=row_label,
         company_name=company_name,
     )
-    ded_line = ""
     if collect_deductible:
-        ded_line = (
-            f'字段 "deductible"：该行免赔额；原文无金额、为 /、或无法确定时一律 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"。'
+        result_schema_line = (
+            '根对象有且仅有一个键 "result"，值为对象；'
+            "该对象含键 coverage、premium、deductible，值均为字符串："
+        )
+        deductible_line = "deductible 为该行免赔额金额字符串；"
+        example_line = (
+            f'示例：{{"result":{{"coverage":"500000.00","premium":"1200.00",'
+            '"deductible":"0.00"}}。'
         )
     else:
-        ded_line = f'字段 "deductible"：无单独免赔列时固定输出 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"。'
+        result_schema_line = (
+            '根对象有且仅有一个键 "result"，值为对象；'
+            "该对象含键 coverage、premium，值均为字符串："
+        )
+        deductible_line = ""
+        example_line = '示例：{"result":{"coverage":"500000.00","premium":"1200.00"}}。'
 
     passenger_cov_hint = ""
     if (
@@ -3371,17 +3392,13 @@ def _doubao_infer_commercial_detail_row(
         "你是车险商业险承保险种明细表抽取助手。"
         + user_ctx_line_desc
         + "你必须只根据原文抽取，禁止编造。"
-        "你必须只输出一个合法 JSON 对象（UTF-8），不要 markdown、不要解释。"
-        '根对象有且仅有一个键 "result"，值为对象；该对象含键 coverage、premium、deductible，值均为字符串：'
-        "coverage 为保额原文中的金额（可含千分位、小数、元/万元等，与单元格一致即可）；"
-        "premium 为保费金额字符串；"
-        + ded_line
-        + f'coverage 或 premium 无法从原文确定时，对应键必须输出 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"；'
-        + f'工程侧会把 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}" 识别为未命中并返回空字符串。'
-        + (
-            f'示例：{{"result":{{"coverage":"500000.00","premium":"1200.00",'
-            f'"deductible":"{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"}}}}。'
-        )
+        + "你必须只输出一个合法 JSON 对象（UTF-8），不要 markdown、不要解释。"
+        + result_schema_line
+        + "coverage 为保额原文中的金额（可含千分位、小数、元/万元等，与单元格一致即可）；"
+        + "premium 为保费金额字符串；"
+        + deductible_line
+        + f'某个字段识别不到就输出 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"。'
+        + example_line
         + passenger_cov_hint
     )
     user_content = commercial_pass2_build_user_prompt_with_extract_table(

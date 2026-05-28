@@ -457,9 +457,9 @@ def build_extract_table_words_header_section_preamble(
             "表头相关文字与横坐标（单位 pt）如下："
         )
     return (
-        f'下列词条为从 PDF 前几页 ``get_text("words")`` 中检出的、文本含「{joined}」任一字样的行（'
-        "每行含词序号、bbox、block_no、line_no、word_no（与 PyMuPDF 词条结构一致）；"
-        f"并含 ``column_index``（1-based），与下列对应：{pair_desc}；"
+        f'下列词条为从 PDF 前几页检出的、文本含「{joined}」任一字样的表头相关文字（'
+        "每行含坐标与单行化文本；"
+        f"列对应关系：{pair_desc}；"
         "文本列已单行化（换行与制表符已压为空白，过长截断）。"
         "表头相关文字与坐标（单位 pt）如下："
     )
