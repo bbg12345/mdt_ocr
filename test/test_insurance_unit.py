@@ -540,20 +540,20 @@ def test_run_car_insurance_premium_total_passes() -> None:
 
 
 def test_pass2_premium_neighbor_from_block_items() -> None:
-    """参照块与其它块分列时：pass2 在纵向条带、参照左边线右侧的邻块中取金额。"""
-    # page, x0,y0,x1,y1,text — y 使用 PyMuPDF 惯例；条带含两框
-    ref = (0, 40.0, 80.0, 120.0, 96.0, "保险费合计(人民币)")
-    amt = (0, 200.0, 82.0, 290.0, 98.0, "净值 1777.77 备注")
-    left_noise = (0, 10.0, 82.0, 35.0, 98.0, "3.33")  # x1 < ref_x0 - eps，排除
-    further = (0, 302.0, 82.0, 370.0, 98.0, "12.34")
+    """参照 word 与其它 word 分列时：pass2 在纵向条带、参照左边线右侧的邻 word 中取金额。"""
+    # page, word_index, x0,y0,x1,y1,text, block_no,line_no,word_no — y 使用 PyMuPDF 惯例；条带含两框
+    ref = (0, 2, 40.0, 80.0, 120.0, 96.0, "保险费合计(人民币)", 0, 0, 1)
+    amt = (0, 4, 200.0, 82.0, 290.0, 98.0, "1777.77", 1, 0, 1)
+    left_noise = (0, 1, 10.0, 82.0, 35.0, 98.0, "3333.33", 0, 0, 0)  # x1 < ref_x0 - eps，排除
+    further = (0, 5, 302.0, 82.0, 370.0, 98.0, "1212.34", 2, 0, 1)
     items = [left_noise, ref, amt, further]
     assert _pass2_premium_neighbor_amount_from_block_items(items, engine_label_for_log="test") == "1777.77"
 
 
 def test_pass2_premium_neighbor_minimal_items() -> None:
     items = [
-        (0, 40.0, 80.0, 120.0, 96.0, "保险费合计"),
-        (0, 200.0, 82.0, 290.0, 98.0, "6666.66"),
+        (0, 1, 40.0, 80.0, 120.0, 96.0, "保险费合计", 0, 0, 0),
+        (0, 2, 200.0, 82.0, 290.0, 98.0, "6666.66", 1, 0, 0),
     ]
     assert _pass2_premium_neighbor_amount_from_block_items(items) == "6666.66"
 
@@ -772,6 +772,7 @@ def test_run_car_insurance_ping_an_premium_detail_passes_pymupdf_like_blocks() -
 
 def test_aggregate_pass2_deductibles_all_zero() -> None:
     assert _aggregate_pass2_deductibles_from_llm_strings(["0", "/", "0.00"]) == "0"
+    assert _aggregate_pass2_deductibles_from_llm_strings(["", "/", "-"]) is None
 
 
 def test_aggregate_pass2_deductibles_max_nonzero() -> None:
@@ -830,9 +831,8 @@ def test_pass1_damage_deductible_from_blocks_bohai_and_zhongyin_patterns() -> No
         ci._pass1_damage_deductible_from_blocks(
             ["车 损 险 每 次 事故 绝对免赔额 ￥ （元）"],
             engine_label="test",
-            empty_as_zero=True,
         )
-        == "0"
+        is None
     )
     assert (
         ci._pass1_damage_deductible_from_blocks(
