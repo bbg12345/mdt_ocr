@@ -13,6 +13,7 @@ HTTP 层见 ``ocr_service``；PDF 通用工具见 ``common``。
 from __future__ import annotations
 
 import atexit
+import io
 import json
 import logging
 from dataclasses import dataclass
@@ -34,9 +35,9 @@ from common import (
     extract_table,
     format_pymupdf_block_text_like_cluster_script,
     iter_pymupdf_block_rect_items,
-    iter_pymupdf_text_blocks,
     iter_pymupdf_word_rect_items,
     load_pdf_bytes,
+    norm_paren_for_table_header_match,
     pymupdf_prompt_meta_str,
     split_pypdf_text_into_blocks,
 )
@@ -98,6 +99,112 @@ _CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS: tuple[str, ...] = (
     "新能源汽车车上人员责任保险(乘客)保额",
     "免赔额",
 )
+
+
+PymupdfBlockRectItem = Tuple[int, float, float, float, float, str]
+PymupdfWordRectItem = Tuple[int, int, float, float, float, float, str, int, int, int]
+
+
+@dataclass(frozen=True)
+class CarInsurancePdfViews:
+    """车险抽取统一输入视图；当前只预抽 PDF 前两页。"""
+
+    pdf_bytes: bytes
+    pypdf_page_texts: List[str]
+    pypdf_blocks: List[str]
+    pymupdf_blocks: List[str]
+    pymupdf_block_rect_items: List[PymupdfBlockRectItem]
+    pymupdf_word_rect_items: List[PymupdfWordRectItem]
+
+
+def extract_car_insurance_pdf_views(
+    pdf_bytes: bytes,
+    *,
+    max_pages: int = 2,
+) -> CarInsurancePdfViews:
+    from pypdf import PdfReader
+    import fitz
+
+    page_limit = max(0, int(max_pages))
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pypdf_page_texts = [
+        (reader.pages[i].extract_text() or "")
+        for i in range(min(page_limit, len(reader.pages)))
+    ]
+    pypdf_blocks: List[str] = []
+    for page_text in pypdf_page_texts:
+        pypdf_blocks.extend(split_pypdf_text_into_blocks(page_text))
+
+    pymupdf_block_rect_items: List[PymupdfBlockRectItem] = []
+    pymupdf_word_rect_items: List[PymupdfWordRectItem] = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for pi in range(min(page_limit, doc.page_count)):
+            page = doc[pi]
+            for b in page.get_text("blocks") or []:
+                if len(b) < 5:
+                    continue
+                btype: Optional[int] = None
+                if len(b) > 6:
+                    try:
+                        btype = int(b[6])
+                    except (TypeError, ValueError):
+                        btype = None
+                if btype == 1:
+                    continue
+                txt = b[4] if isinstance(b[4], str) else str(b[4])
+                text = txt.strip()
+                if not text:
+                    continue
+                pymupdf_block_rect_items.append(
+                    (pi, float(b[0]), float(b[1]), float(b[2]), float(b[3]), text),
+                )
+
+            for wi, w in enumerate(page.get_text("words") or [], start=1):
+                if len(w) < 5:
+                    continue
+                raw = w[4]
+                wt = raw if isinstance(raw, str) else str(raw)
+                text = wt.strip()
+                if not text:
+                    continue
+                try:
+                    bn = int(float(w[5])) if len(w) > 5 else -1
+                except (TypeError, ValueError):
+                    bn = -1
+                try:
+                    ln = int(float(w[6])) if len(w) > 6 else -1
+                except (TypeError, ValueError):
+                    ln = -1
+                try:
+                    wn = int(float(w[7])) if len(w) > 7 else -1
+                except (TypeError, ValueError):
+                    wn = -1
+                pymupdf_word_rect_items.append(
+                    (
+                        pi,
+                        wi,
+                        float(w[0]),
+                        float(w[1]),
+                        float(w[2]),
+                        float(w[3]),
+                        text,
+                        bn,
+                        ln,
+                        wn,
+                    ),
+                )
+    finally:
+        doc.close()
+
+    return CarInsurancePdfViews(
+        pdf_bytes=pdf_bytes,
+        pypdf_page_texts=pypdf_page_texts,
+        pypdf_blocks=pypdf_blocks,
+        pymupdf_blocks=[row[5] for row in pymupdf_block_rect_items],
+        pymupdf_block_rect_items=pymupdf_block_rect_items,
+        pymupdf_word_rect_items=pymupdf_word_rect_items,
+    )
 
 
 def _car_insurance_empty_kv(policy_type: str) -> Dict[str, Any]:
@@ -346,16 +453,22 @@ def _doubao_infer_insurer_name(context_block: str) -> Optional[str]:
 
 
 def _pass5_insurer_name_doubao_llm(
-    pdf_bytes: bytes,
+    pdf_bytes: Optional[bytes] = None,
     *,
     engine_label: str,
     anchor_fallback: bool = False,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
 ) -> Optional[str]:
     """基于「关键字块 bbox」±纵带筛块，拼装坐标+文本调用豆包。"""
-    try:
-        items = iter_pymupdf_block_rect_items(pdf_bytes)
-    except ImportError:
-        return None
+    if block_rect_items is None:
+        if pdf_bytes is None:
+            return None
+        try:
+            items = iter_pymupdf_block_rect_items(pdf_bytes)
+        except ImportError:
+            return None
+    else:
+        items = list(block_rect_items)
 
     ai = _insurer_kw_anchor_flat_index(items)
     if ai is None and anchor_fallback:
@@ -695,6 +808,7 @@ def run_car_insurance_insurer_passes(
     *,
     engine_label: str,
     pdf_bytes: Optional[bytes] = None,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
     defer_bbox_llm: bool = False,
 ) -> Dict[str, Any]:
     state = INSURER_EXTRACTION_STATE
@@ -753,8 +867,8 @@ def run_car_insurance_insurer_passes(
             _log_pass(engine_label, state, 4, "命中：known_company=%s", known_company.name)
 
     pass5_hit: Optional[str] = None
-    bbox_llm_bytes = None if defer_bbox_llm else pdf_bytes
-    if bbox_llm_bytes is not None:
+    can_run_bbox_llm = not defer_bbox_llm and (pdf_bytes is not None or block_rect_items is not None)
+    if can_run_bbox_llm:
         pic_pass5_overlay = (
             insurer_display is not None
             and _insurer_display_suggests_pic_for_pass5_overlay(insurer_display, known_company)
@@ -762,9 +876,10 @@ def run_car_insurance_insurer_passes(
         run_pass5 = insurer_display is None or pic_pass5_overlay
         if run_pass5:
             cand5 = _pass5_insurer_name_doubao_llm(
-                bbox_llm_bytes,
+                pdf_bytes,
                 engine_label=engine_label,
                 anchor_fallback=(insurer_display is None),
+                block_rect_items=block_rect_items,
             )
             cand5 = _pass3_filter_insurer_name(cand5, from_pass=5, engine_label=engine_label)
             if cand5 is not None and cand5.strip() != "":
@@ -1013,18 +1128,24 @@ def _valid_whole_pattern_text(
 
 
 def _pass2_keyed_token_with_bbox(
-    pdf_bytes: bytes,
+    pdf_bytes: Optional[bytes] = None,
     *,
     keywords: Sequence[str],
     token_re: re.Pattern[str],
     validator: Callable[[str], bool],
     engine_label: str,
     output_key: str,
+    word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Optional[str]:
-    try:
-        words = iter_pymupdf_word_rect_items(pdf_bytes)
-    except Exception:
-        return None
+    if word_rect_items is None:
+        if pdf_bytes is None:
+            return None
+        try:
+            words = iter_pymupdf_word_rect_items(pdf_bytes)
+        except Exception:
+            return None
+    else:
+        words = list(word_rect_items)
 
     ref = next(
         (
@@ -1090,6 +1211,7 @@ def run_car_insurance_keyed_token_passes(
     validator: Callable[[str], bool],
     state: ExtractionState,
     pdf_bytes: Optional[bytes] = None,
+    word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Dict[str, Any]:
     keywords = (keyword,) if isinstance(keyword, str) else tuple(keyword)
     pass1_hit: Optional[str] = None
@@ -1107,7 +1229,7 @@ def run_car_insurance_keyed_token_passes(
             break
 
     pass2_hit: Optional[str] = None
-    if pass1_hit is None and pdf_bytes is not None:
+    if pass1_hit is None and (pdf_bytes is not None or word_rect_items is not None):
         pass2_hit = _pass2_keyed_token_with_bbox(
             pdf_bytes,
             keywords=keywords,
@@ -1115,6 +1237,7 @@ def run_car_insurance_keyed_token_passes(
             validator=validator,
             engine_label=engine_label,
             output_key=output_key,
+            word_rect_items=word_rect_items,
         )
         if pass2_hit is not None:
             _log_pass(engine_label, state, 2, "bbox条带命中：%s=%r", output_key, pass2_hit)
@@ -1133,6 +1256,7 @@ def run_car_insurance_license_plate_passes(
     *,
     engine_label: str,
     pdf_bytes: Optional[bytes] = None,
+    word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Dict[str, Any]:
     return run_car_insurance_keyed_token_passes(
         blocks,
@@ -1143,6 +1267,7 @@ def run_car_insurance_license_plate_passes(
         validator=_license_plate_token_passes,
         state=LICENSE_PLATE_EXTRACTION_STATE,
         pdf_bytes=pdf_bytes,
+        word_rect_items=word_rect_items,
     )
 
 
@@ -1151,6 +1276,7 @@ def run_car_insurance_vin_passes(
     *,
     engine_label: str,
     pdf_bytes: Optional[bytes] = None,
+    word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Dict[str, Any]:
     return run_car_insurance_keyed_token_passes(
         blocks,
@@ -1161,6 +1287,7 @@ def run_car_insurance_vin_passes(
         validator=_vin_token_passes,
         state=VIN_EXTRACTION_STATE,
         pdf_bytes=pdf_bytes,
+        word_rect_items=word_rect_items,
     )
 
 
@@ -1196,7 +1323,11 @@ def _pass1_sign_date_from_block(block: str) -> Optional[str]:
     return _extract_sign_date_from_text(tail)
 
 
-def _pass3_sign_date_with_bbox_fallback(pdf_bytes: bytes) -> Optional[str]:
+def _pass3_sign_date_with_bbox_fallback(
+    pdf_bytes: Optional[bytes] = None,
+    *,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
+) -> Optional[str]:
     """
     基于 bbox 块回退提取签单日期（与保险期间 bbox 回退一致的纵向条带）：
     1) 找到包含「签单日期」的参考块；
@@ -1204,78 +1335,48 @@ def _pass3_sign_date_with_bbox_fallback(pdf_bytes: bytes) -> Optional[str]:
        即 y0 >= ref_y0 - tol 且 y1 <= ref_y1 + tol，避免跨行误取；
     3) 条带内各块（含参考块）按 (y0, x0) 顺序，在全文上匹配日期 pattern。
     """
-    try:
-        import fitz
-    except ImportError:
-        logger.debug("PyMuPDF未安装，无法使用签单日期bbox回退逻辑")
-        return None
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        all_blocks: List[Tuple[int, float, float, float, float, str]] = []
-        sign_blocks: List[Tuple[int, float, float, float, float, str]] = []
-
-        for page_index in range(doc.page_count):
-            page = doc[page_index]
-            raw_blocks = page.get_text("blocks")
-            if not raw_blocks:
-                continue
-
-            for b in raw_blocks:
-                if len(b) < 5:
-                    continue
-                btype = None
-                if len(b) > 6:
-                    try:
-                        btype = int(b[6])
-                    except (TypeError, ValueError):
-                        btype = None
-                if btype == 1:
-                    continue
-
-                text = b[4] if isinstance(b[4], str) else str(b[4])
-                text = text.strip()
-                if not text:
-                    continue
-
-                x0, y0, x1, y1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
-                item = (page_index, x0, y0, x1, y1, text)
-                all_blocks.append(item)
-                if "签单日期" in text:
-                    sign_blocks.append(item)
-
-        if not sign_blocks:
-            logger.debug("签单日期bbox回退逻辑：未找到包含'签单日期'的块")
+    if block_rect_items is None:
+        if pdf_bytes is None:
             return None
+        try:
+            all_blocks = iter_pymupdf_block_rect_items(pdf_bytes)
+        except ImportError:
+            logger.debug("PyMuPDF未安装，无法使用签单日期bbox回退逻辑")
+            return None
+    else:
+        all_blocks = list(block_rect_items)
+    sign_blocks = [item for item in all_blocks if "签单日期" in item[5]]
 
-        ref_page, ref_x0, ref_y0, ref_x1, ref_y1, ref_text = sign_blocks[0]
-        logger.debug(
-            "签单日期bbox回退逻辑：参考块 page=%s y0=%.2f y1=%.2f text=%r",
-            ref_page,
-            ref_y0,
-            ref_y1,
-            ref_text,
-        )
-
-        y_tolerance = 20.0
-        candidates: List[Tuple[float, float, str]] = []
-        for page_index, x0, y0, x1, y1, text in all_blocks:
-            if page_index != ref_page:
-                continue
-            if y0 >= ref_y0 - y_tolerance and y1 <= ref_y1 + y_tolerance:
-                candidates.append((y0, x0, text))
-
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        for _, _, text in candidates:
-            v = _extract_sign_date_from_text(text)
-            if v is not None:
-                logger.debug("签单日期bbox回退逻辑命中：%s", v)
-                return v
-
-        logger.debug("签单日期bbox回退逻辑：候选块未匹配到日期")
+    if not sign_blocks:
+        logger.debug("签单日期bbox回退逻辑：未找到包含'签单日期'的块")
         return None
-    finally:
-        doc.close()
+
+    ref_page, ref_x0, ref_y0, ref_x1, ref_y1, ref_text = sign_blocks[0]
+    logger.debug(
+        "签单日期bbox回退逻辑：参考块 page=%s y0=%.2f y1=%.2f text=%r",
+        ref_page,
+        ref_y0,
+        ref_y1,
+        ref_text,
+    )
+
+    y_tolerance = 20.0
+    candidates: List[Tuple[float, float, str]] = []
+    for page_index, x0, y0, x1, y1, text in all_blocks:
+        if page_index != ref_page:
+            continue
+        if y0 >= ref_y0 - y_tolerance and y1 <= ref_y1 + y_tolerance:
+            candidates.append((y0, x0, text))
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    for _, _, text in candidates:
+        v = _extract_sign_date_from_text(text)
+        if v is not None:
+            logger.debug("签单日期bbox回退逻辑命中：%s", v)
+            return v
+
+    logger.debug("签单日期bbox回退逻辑：候选块未匹配到日期")
+    return None
 
 
 def run_car_insurance_sign_date_passes(
@@ -1283,6 +1384,7 @@ def run_car_insurance_sign_date_passes(
     *,
     engine_label: str,
     pdf_bytes: Optional[bytes] = None,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
 ) -> Dict[str, Any]:
     state = SIGN_DATE_EXTRACTION_STATE
 
@@ -1317,8 +1419,11 @@ def run_car_insurance_sign_date_passes(
                 break
 
     pass3_hit: Optional[str] = None
-    if pass1_hit is None and pass2_hit is None and pdf_bytes is not None:
-        pass3_hit = _pass3_sign_date_with_bbox_fallback(pdf_bytes)
+    if pass1_hit is None and pass2_hit is None and (pdf_bytes is not None or block_rect_items is not None):
+        pass3_hit = _pass3_sign_date_with_bbox_fallback(
+            pdf_bytes,
+            block_rect_items=block_rect_items,
+        )
         if pass3_hit is not None:
             _log_pass(engine_label, state, 3, "bbox条带回退命中：签单日期=%r", pass3_hit)
 
@@ -1503,53 +1608,33 @@ def _pass2_premium_neighbor_amount_from_block_items(
     return None
 
 
-def _pass2_premium_total_with_bbox_fallback(pdf_bytes: bytes, *, engine_label: str = "pymupdf") -> Optional[str]:
+def _pass2_premium_total_with_bbox_fallback(
+    pdf_bytes: Optional[bytes] = None,
+    *,
+    engine_label: str = "pymupdf",
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
+) -> Optional[str]:
     """
     PyMuPDF 打开 PDF / ``get_text("blocks")``，再交由
     `_pass2_premium_neighbor_amount_from_block_items`。
 
     ``engine_label`` 仅用于调试日志前缀（双路同源几何逻辑）。
     """
-    try:
-        import fitz
-    except ImportError:
-        logger.debug("PyMuPDF未安装，无法使用保险费合计 bbox pass2")
-        return None
+    if block_rect_items is None:
+        if pdf_bytes is None:
+            return None
+        try:
+            all_blocks = iter_pymupdf_block_rect_items(pdf_bytes)
+        except ImportError:
+            logger.debug("PyMuPDF未安装，无法使用保险费合计 bbox pass2")
+            return None
+    else:
+        all_blocks = list(block_rect_items)
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        all_blocks: List[Tuple[int, float, float, float, float, str]] = []
-
-        for page_index in range(doc.page_count):
-            page = doc[page_index]
-            raw_blocks = page.get_text("blocks") or []
-
-            for b in raw_blocks:
-                if len(b) < 5:
-                    continue
-                btype = None
-                if len(b) > 6:
-                    try:
-                        btype = int(b[6])
-                    except (TypeError, ValueError):
-                        btype = None
-                if btype == 1:
-                    continue
-
-                text = b[4] if isinstance(b[4], str) else str(b[4])
-                text = text.strip()
-                if not text:
-                    continue
-
-                x0, y0, x1, y1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
-                all_blocks.append((page_index, x0, y0, x1, y1, text))
-
-        return _pass2_premium_neighbor_amount_from_block_items(
-            all_blocks,
-            engine_label_for_log=engine_label,
-        )
-    finally:
-        doc.close()
+    return _pass2_premium_neighbor_amount_from_block_items(
+        all_blocks,
+        engine_label_for_log=engine_label,
+    )
 
 
 def run_car_insurance_premium_total_passes(
@@ -1557,6 +1642,7 @@ def run_car_insurance_premium_total_passes(
     *,
     engine_label: str,
     pdf_bytes: Optional[bytes] = None,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
 ) -> Dict[str, Any]:
     state = PREMIUM_TOTAL_EXTRACTION_STATE
     pass1_hit: Optional[str] = None
@@ -1570,10 +1656,11 @@ def run_car_insurance_premium_total_passes(
             break
 
     pass2_hit: Optional[str] = None
-    if pass1_hit is None and pdf_bytes is not None:
+    if pass1_hit is None and (pdf_bytes is not None or block_rect_items is not None):
         pass2_hit = _pass2_premium_total_with_bbox_fallback(
             pdf_bytes,
             engine_label=engine_label,
+            block_rect_items=block_rect_items,
         )
         if pass2_hit is not None:
             _log_pass(engine_label, state, 2, "bbox 邻块命中：保险费合计=%r", pass2_hit)
@@ -2303,14 +2390,20 @@ def _pass2_damage_deductible_from_word_items(
 
 
 def _pass2_damage_deductible_with_bbox_fallback(
-    pdf_bytes: bytes,
+    pdf_bytes: Optional[bytes] = None,
     *,
     engine_label: str = "pymupdf",
+    word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Optional[str]:
-    try:
-        word_items = iter_pymupdf_word_rect_items(pdf_bytes)
-    except ImportError:
-        return None
+    if word_rect_items is None:
+        if pdf_bytes is None:
+            return None
+        try:
+            word_items = iter_pymupdf_word_rect_items(pdf_bytes)
+        except ImportError:
+            return None
+    else:
+        word_items = list(word_rect_items)
     return _pass2_damage_deductible_from_word_items(
         word_items,
         engine_label=engine_label,
@@ -2613,6 +2706,94 @@ class CommercialPass2TableHeaderExtractSpec:
             sort_mode=self.sort_mode,
             words_line_format=self.words_line_format,
         ).strip()
+
+
+def _extract_table_header_column_pairs_local(
+    header_texts_in_column_order: Sequence[str],
+    column_indices: Sequence[int],
+) -> List[Tuple[str, int]]:
+    return [
+        (text, int(column_indices[i]))
+        for i, text in enumerate(header_texts_in_column_order)
+        if text
+    ]
+
+
+def _table_item_matched_min_column_local(text: str, pairs: Sequence[Tuple[str, int]]) -> int:
+    normalized = norm_paren_for_table_header_match(text)
+    matched = [
+        col
+        for header, col in pairs
+        if norm_paren_for_table_header_match(header) in normalized
+    ]
+    return min(matched) if matched else 0
+
+
+def _extract_table_lines_from_precomputed_items(
+    table_header_spec: CommercialPass2TableHeaderExtractSpec,
+    *,
+    block_rect_items: Sequence[PymupdfBlockRectItem],
+    word_rect_items: Sequence[PymupdfWordRectItem],
+) -> str:
+    pairs = _extract_table_header_column_pairs_local(
+        table_header_spec.header_texts_in_column_order,
+        table_header_spec.column_indices,
+    )
+    if not pairs:
+        return ""
+
+    def excluded(text: str) -> bool:
+        return any(ex in text for ex in table_header_spec.exclude_substrings)
+
+    def matched(text: str) -> bool:
+        normalized = norm_paren_for_table_header_match(text)
+        return any(norm_paren_for_table_header_match(header) in normalized for header, _col in pairs)
+
+    if table_header_spec.extract_source == "blocks":
+        picked_b: List[Tuple[int, int, int, float, float, float, float, str]] = []
+        page_counts: Dict[int, int] = {}
+        for pi, x0, y0, x1, y1, text in block_rect_items:
+            if pi > table_header_spec.max_page_index:
+                continue
+            page_counts[pi] = page_counts.get(pi, 0) + 1
+            if excluded(text) or not matched(text):
+                continue
+            rank = _table_item_matched_min_column_local(text, pairs)
+            picked_b.append((rank, pi, page_counts[pi], x0, y0, x1, y1, text))
+        if table_header_spec.sort_mode == "column_rank_then_geom":
+            picked_b.sort(key=lambda row: (row[0], row[1], row[4], row[3]))
+        return "\n".join(
+            f"page_index={pi}\tcolumn_index={rank}\tblock_index={bi}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
+            f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\t{format_pymupdf_block_text_like_cluster_script(text)}"
+            for rank, pi, bi, x0, y0, x1, y1, text in picked_b
+        ).strip()
+
+    picked_w: List[Tuple[int, int, int, float, float, float, float, str, int, int, int]] = []
+    for pi, wi, x0, y0, x1, y1, text, bn, ln, wn in word_rect_items:
+        if pi > table_header_spec.max_page_index:
+            continue
+        if excluded(text) or not matched(text):
+            continue
+        rank = _table_item_matched_min_column_local(text, pairs)
+        picked_w.append((rank, pi, wi, x0, y0, x1, y1, text, bn, ln, wn))
+    if table_header_spec.sort_mode == "column_rank_then_geom":
+        picked_w.sort(key=lambda row: (row[0], row[1], row[5], row[4]))
+
+    lines: List[str] = []
+    for rank, pi, wi, x0, y0, x1, y1, text, bn, ln, wn in picked_w:
+        tcell = format_pymupdf_block_text_like_cluster_script(text)
+        if table_header_spec.words_line_format == "bbox_column_text":
+            lines.append(
+                f"page_index={pi}\tcolumn_index={rank}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
+                f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\t{tcell}"
+            )
+        else:
+            lines.append(
+                f"page_index={pi}\tcolumn_index={rank}\tword_index={wi}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
+                f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\tblock_no={pymupdf_prompt_meta_str(bn)}\t"
+                f"line_no={pymupdf_prompt_meta_str(ln)}\tword_no={pymupdf_prompt_meta_str(wn)}\t{tcell}"
+            )
+    return "\n".join(lines).strip()
 
 
 def _commercial_pass2_table_header_spec_from_cfg(
@@ -3153,6 +3334,8 @@ def run_car_insurance_commercial_detail_pass2_doubao(
     company: KnownInsuranceCompany,
     *,
     engine_label: str,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
+    word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Dict[str, str]:
     """
     PyMuPDF 扁平项（**仅前两页**）：先按行锚在 ``text`` 内定位险种名，再取锚项纵坐标 ±pad 的项拼上下文，
@@ -3175,11 +3358,15 @@ def run_car_insurance_commercial_detail_pass2_doubao(
     collect_ded = company == KnownInsuranceCompany.HUA_AN
     ded_raws: List[str] = []
 
-    try:
-        blocks_all = iter_pymupdf_block_rect_items(pdf_bytes)
-        words_all = iter_pymupdf_word_rect_items(pdf_bytes)
-    except ImportError:
-        return out
+    if block_rect_items is None or word_rect_items is None:
+        try:
+            blocks_all = iter_pymupdf_block_rect_items(pdf_bytes) if block_rect_items is None else list(block_rect_items)
+            words_all = iter_pymupdf_word_rect_items(pdf_bytes) if word_rect_items is None else list(word_rect_items)
+        except ImportError:
+            return out
+    else:
+        blocks_all = list(block_rect_items)
+        words_all = list(word_rect_items)
 
     block_items = [
         row
@@ -3197,7 +3384,11 @@ def run_car_insurance_commercial_detail_pass2_doubao(
     table_header_section_preamble: str = ""
     table_header_spec = _COMMERCIAL_PASS2_TABLE_HEADER_SPEC_BY_COMPANY.get(company)
     if table_header_spec is not None:
-        precomputed_table_header_lines = table_header_spec.extract_table_lines(pdf_bytes)
+        precomputed_table_header_lines = _extract_table_lines_from_precomputed_items(
+            table_header_spec,
+            block_rect_items=block_items,
+            word_rect_items=word_items,
+        )
         table_header_section_preamble = build_extract_table_words_header_section_preamble(
             table_header_spec.header_texts_in_column_order,
             table_header_spec.column_indices,
@@ -3574,7 +3765,11 @@ def extract_insurance_period_from_blocks(
     return None
 
 
-def _extract_period_with_bbox_fallback(pdf_bytes: bytes) -> Optional[Dict[str, str]]:
+def _extract_period_with_bbox_fallback(
+    pdf_bytes: Optional[bytes] = None,
+    *,
+    block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
+) -> Optional[Dict[str, str]]:
     """
     使用PyMuPDF的块bbox坐标信息提取保险期间（回退逻辑）。
     1. 获取所有文本块及其bbox
@@ -3582,103 +3777,63 @@ def _extract_period_with_bbox_fallback(pdf_bytes: bytes) -> Optional[Dict[str, s
     3. 查找纵坐标相近的候选块（时间应该不高于保险期间块，不低于或略低于）
     4. 在候选块中匹配日期时间pattern
     """
-    try:
-        import fitz
-    except ImportError:
-        logger.debug("PyMuPDF未安装，无法使用bbox回退逻辑")
+    if block_rect_items is None:
+        if pdf_bytes is None:
+            return None
+        try:
+            source_blocks = iter_pymupdf_block_rect_items(pdf_bytes)
+        except ImportError:
+            logger.debug("PyMuPDF未安装，无法使用bbox回退逻辑")
+            return None
+    else:
+        source_blocks = list(block_rect_items)
+
+    all_blocks = [(x0, y0, x1, y1, text) for _pi, x0, y0, x1, y1, text in source_blocks]
+    period_blocks = [
+        (x0, y0, x1, y1, text)
+        for _pi, x0, y0, x1, y1, text in source_blocks
+        if "保险期间" in text
+    ]
+
+    if not period_blocks:
+        logger.debug("bbox回退逻辑：未找到包含'保险期间'的块")
         return None
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        all_blocks = []  # 列表元素: (x0, y0, x1, y1, text)
-        period_blocks = []  # 包含"保险期间"的块
+    ref_x0, ref_y0, ref_x1, ref_y1, ref_text = period_blocks[0]
+    logger.debug("bbox回退逻辑：参考块 y0=%.2f, y1=%.2f, 文本=%r", ref_y0, ref_y1, ref_text)
 
-        for page_index in range(doc.page_count):
-            page = doc[page_index]
-            raw_blocks = page.get_text("blocks")
-            if not raw_blocks:
-                continue
+    y_tolerance = 10.0
+    candidate_texts = []
+    for x0, y0, x1, y1, text in all_blocks:
+        if (x0, y0, x1, y1, text) == (ref_x0, ref_y0, ref_x1, ref_y1, ref_text):
+            continue
+        if y0 >= ref_y0 - y_tolerance and y1 <= ref_y1 + y_tolerance:
+            candidate_texts.append(text)
 
-            for b in raw_blocks:
-                if len(b) < 5:
-                    continue
-                # b[0:4] 是 x0, y0, x1, y1
-                # b[4] 是文本
-                # b[6] 是块类型（0=文本，1=图像）
-                btype = None
-                if len(b) > 6:
-                    try:
-                        btype = int(b[6])
-                    except (TypeError, ValueError):
-                        btype = None
-                if btype == 1:  # 跳过图像块
-                    continue
+    if not candidate_texts:
+        logger.debug("bbox回退逻辑：未找到符合条件的候选块")
+        return None
 
-                text = b[4] if isinstance(b[4], str) else str(b[4])
-                text = text.strip()
-                if not text:
-                    continue
+    combined_text = " ".join(candidate_texts)
+    dates = _find_dates_in_text(combined_text)
+    logger.debug("bbox回退逻辑：候选文本中找到日期: %s", dates)
 
-                x0, y0, x1, y1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
-                all_blocks.append((x0, y0, x1, y1, text))
+    if len(dates) >= 2:
+        period = _extract_period_from_dates(dates)
+        if period:
+            logger.debug("bbox回退逻辑：提取到保险期间: %s", period)
+            return period
 
-                if "保险期间" in text:
-                    period_blocks.append((x0, y0, x1, y1, text))
-
-        if not period_blocks:
-            logger.debug("bbox回退逻辑：未找到包含'保险期间'的块")
-            return None
-
-        # 使用第一个找到的"保险期间"块作为参考
-        ref_x0, ref_y0, ref_x1, ref_y1, ref_text = period_blocks[0]
-        logger.debug("bbox回退逻辑：参考块 y0=%.2f, y1=%.2f, 文本=%r", ref_y0, ref_y1, ref_text)
-
-        # 定义纵坐标容差：时间块应该不高于参考块，不低于或略低于参考块
-        # 不高于：候选块的y0应该 >= ref_y0 - tolerance
-        # 不低于或略低于：候选块的y1应该 <= ref_y1 + tolerance
-        y_tolerance = 10.0  # 点，可根据实际情况调整
-
-        candidate_texts = []
-        for x0, y0, x1, y1, text in all_blocks:
-            # 跳过参考块本身
-            if (x0, y0, x1, y1, text) == (ref_x0, ref_y0, ref_x1, ref_y1, ref_text):
-                continue
-
-            # 检查纵坐标条件：时间块应该不高于保险期间块，不低于或略低于
-            # 条件1: y0 >= ref_y0 - y_tolerance (不高于)
-            # 条件2: y1 <= ref_y1 + y_tolerance (不低于或略低于)
-            if y0 >= ref_y0 - y_tolerance and y1 <= ref_y1 + y_tolerance:
-                candidate_texts.append(text)
-
-        if not candidate_texts:
-            logger.debug("bbox回退逻辑：未找到符合条件的候选块")
-            return None
-
-        # 合并候选文本，查找日期
-        combined_text = " ".join(candidate_texts)
-        dates = _find_dates_in_text(combined_text)
-        logger.debug("bbox回退逻辑：候选文本中找到日期: %s", dates)
-
+    for text in candidate_texts:
+        dates = _find_dates_in_text(text)
         if len(dates) >= 2:
             period = _extract_period_from_dates(dates)
             if period:
-                logger.debug("bbox回退逻辑：提取到保险期间: %s", period)
+                logger.debug("bbox回退逻辑：在单个候选块中提取到保险期间: %s", period)
                 return period
 
-        # 如果没找到两个日期，尝试在单个候选块中查找
-        for text in candidate_texts:
-            dates = _find_dates_in_text(text)
-            if len(dates) >= 2:
-                period = _extract_period_from_dates(dates)
-                if period:
-                    logger.debug("bbox回退逻辑：在单个候选块中提取到保险期间: %s", period)
-                    return period
-
-        logger.debug("bbox回退逻辑：在候选块中未找到足够的日期")
-        return None
-
-    finally:
-        doc.close()
+    logger.debug("bbox回退逻辑：在候选块中未找到足够的日期")
+    return None
 
 
 def _policy_type_is_commercial(policy_type: str) -> bool:
@@ -3699,9 +3854,12 @@ def car_insurance_extract(
     若模型返回通过 pass3 筛选的有效全称，则以豆包为准覆盖规则结果。
     """
     pdf_bytes = load_pdf_bytes(pdf_url)
-    blocks_pdf = flatten_pypdf_blocks(pdf_bytes)
-    page_texts_pdf = extract_pypdf_page_texts(pdf_bytes)
-    blocks_mu = iter_pymupdf_text_blocks(pdf_bytes)
+    pdf_views = extract_car_insurance_pdf_views(pdf_bytes)
+    blocks_pdf = pdf_views.pypdf_blocks
+    page_texts_pdf = pdf_views.pypdf_page_texts
+    blocks_mu = pdf_views.pymupdf_blocks
+    block_rect_items = pdf_views.pymupdf_block_rect_items
+    word_rect_items = pdf_views.pymupdf_word_rect_items
 
     is_commercial = _policy_type_is_commercial(policy_type)
     defer_mu_bbox_llm = is_commercial and _commercial_blocks_hint_ping_an_or_hua_an(
@@ -3713,6 +3871,7 @@ def car_insurance_extract(
         blocks_mu,
         engine_label="pymupdf",
         pdf_bytes=pdf_bytes,
+        block_rect_items=block_rect_items,
         defer_bbox_llm=defer_mu_bbox_llm,
     )
     insured_pdf = run_car_insurance_insured_passes(blocks_pdf, engine_label="pypdf")
@@ -3721,33 +3880,33 @@ def car_insurance_extract(
     license_plate_mu = run_car_insurance_license_plate_passes(
         blocks_mu,
         engine_label="pymupdf",
-        pdf_bytes=pdf_bytes,
+        word_rect_items=word_rect_items,
     )
     vin_pdf = run_car_insurance_vin_passes(page_texts_pdf, engine_label="pypdf")
     vin_mu = run_car_insurance_vin_passes(
         blocks_mu,
         engine_label="pymupdf",
-        pdf_bytes=pdf_bytes,
+        word_rect_items=word_rect_items,
     )
     sign_date_pdf = run_car_insurance_sign_date_passes(
         blocks_pdf,
         engine_label="pypdf",
-        pdf_bytes=pdf_bytes,
+        block_rect_items=block_rect_items,
     )
     sign_date_mu = run_car_insurance_sign_date_passes(
         blocks_mu,
         engine_label="pymupdf",
-        pdf_bytes=pdf_bytes,
+        block_rect_items=block_rect_items,
     )
     premium_pdf = run_car_insurance_premium_total_passes(
         blocks_pdf,
         engine_label="pypdf",
-        pdf_bytes=pdf_bytes,
+        block_rect_items=block_rect_items,
     )
     premium_mu = run_car_insurance_premium_total_passes(
         blocks_mu,
         engine_label="pymupdf",
-        pdf_bytes=pdf_bytes,
+        block_rect_items=block_rect_items,
     )
 
     merged_name = _merge_insurer_display_prefer_longer(
@@ -3770,6 +3929,7 @@ def car_insurance_extract(
             pdf_bytes,
             engine_label="commercial_ping_an_hua_an",
             anchor_fallback=True,
+            block_rect_items=block_rect_items,
         )
         ol = _pass3_filter_insurer_name(
             ol,
@@ -3798,7 +3958,9 @@ def car_insurance_extract(
         logger.debug("提取到保险期间: %s", merged_period)
     else:
         logger.debug("未提取到保险期间，尝试bbox回退逻辑")
-        period_fallback = _extract_period_with_bbox_fallback(pdf_bytes)
+        period_fallback = _extract_period_with_bbox_fallback(
+            block_rect_items=block_rect_items,
+        )
         if period_fallback:
             kv["保险期间"] = period_fallback
             logger.debug("bbox回退逻辑提取到保险期间: %s", period_fallback)
@@ -3845,8 +4007,8 @@ def car_insurance_extract(
         ded = ded_mu or ded_pdf
         if not ded:
             ded = _pass2_damage_deductible_with_bbox_fallback(
-                pdf_bytes,
                 engine_label="pymupdf",
+                word_rect_items=word_rect_items,
             )
         if ded:
             kv["免赔额"] = ded
@@ -3856,6 +4018,8 @@ def car_insurance_extract(
             pdf_bytes,
             merged_enum,
             engine_label="pymupdf",
+            block_rect_items=block_rect_items,
+            word_rect_items=word_rect_items,
         )
         for dk in _CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS:
             v2 = detail_p2.get(dk) or ""
