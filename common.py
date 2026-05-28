@@ -398,13 +398,11 @@ def extract_table(
             if words_line_format == "bbox_column_text":
                 if show_column_index:
                     lines_w.append(
-                        f"page_index={pi}\tcolumn_index={rank}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
-                        f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\t{tcell}"
+                        f"x0={x0:.1f}\tx1={x1:.1f}\t{tcell}"
                     )
                 else:
                     lines_w.append(
-                        f"page_index={pi}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
-                        f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\t{tcell}"
+                        f"x0={x0:.1f}\tx1={x1:.1f}\t{tcell}"
                     )
             elif show_column_index:
                 lines_w.append(
@@ -452,11 +450,11 @@ def build_extract_table_words_header_section_preamble(
     pair_desc = "；".join(f"「{h}」→第{c}列" for h, c in zip(texts, cols))
     if words_line_format == "bbox_column_text":
         return (
-            f'下列词条为从 PDF 前几页 ``get_text("words")`` 中检出的、文本含「{joined}」任一字样的行（'
-            "每行仅含 ``page_index``、``column_index``（1-based）、轴对齐 bbox（x0_pt–y1_pt，单位 pt）与单行化文本；"
+            f'下列词条为从 PDF 前几页检出的、文本含「{joined}」任一字样的表头相关文字（'
+            "每行仅含横坐标 ``x0``/``x1``（单位 pt）与单行化文本，x0/x1 分别为文字框左/右边界；"
             f"列对应关系：{pair_desc}；"
             "文本列已单行化（换行与制表符已压为空白，过长截断）。"
-            "表头相关文字与坐标（单位 pt）如下："
+            "表头相关文字与横坐标（单位 pt）如下："
         )
     return (
         f'下列词条为从 PDF 前几页 ``get_text("words")`` 中检出的、文本含「{joined}」任一字样的行（'

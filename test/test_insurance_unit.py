@@ -78,6 +78,37 @@ def test_find_dates_in_text_new_formats() -> None:
         assert result == expected, f"现有格式回归失败: {text}\n期望: {expected}\n实际: {result}"
 
 
+def test_scalar_llm_result_normalization() -> None:
+    got = ci._normalize_scalar_llm_result(
+        {
+            "sign_date": "2025年5月18日",
+            "premium_total": "1,234.56元",
+            "period_start": "2025年5月19日00:00",
+            "period_end": "2026年5月18日24:00",
+        }
+    )
+
+    assert got["签单日期"] == "2025-05-18T00:00:00"
+    assert got["保险费合计"] == "1234.56"
+    assert got["保险期间"] == {
+        "start": "2025-05-19T00:00:00",
+        "end": "2026-05-18T24:00:00",
+    }
+
+
+def test_scalar_llm_not_found_marker_returns_empty_result() -> None:
+    got = ci._normalize_scalar_llm_result(
+        {
+            "sign_date": "__NOT_FOUND__",
+            "premium_total": "__NOT_FOUND__",
+            "period_start": "__NOT_FOUND__",
+            "period_end": "__NOT_FOUND__",
+        }
+    )
+
+    assert got == {}
+
+
 def test_convert_to_iso_format_new_formats() -> None:
     """测试_convert_to_iso_format函数的新格式转换"""
 
@@ -623,6 +654,112 @@ def test_merge_commercial_detail_table_kv_prefers_pymupdf_then_pypdf() -> None:
     assert got["新能源汽车损失保险保费"] == "50.00"
 
 
+def test_commercial_detail_needs_llm_fallback_policy() -> None:
+    empty = {k: "" for k in _CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS}
+    full = {k: "x" for k in _CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS}
+
+    assert ci._commercial_detail_needs_llm_fallback(
+        is_commercial=True,
+        known_company=ci.KnownInsuranceCompany.BO_HAI,
+        has_rule_layout=False,
+        kv=full,
+    )
+    assert ci._commercial_detail_needs_llm_fallback(
+        is_commercial=True,
+        known_company=ci.KnownInsuranceCompany.PING_AN,
+        has_rule_layout=True,
+        kv=empty,
+    )
+    assert ci._commercial_detail_needs_llm_fallback(
+        is_commercial=True,
+        known_company=None,
+        has_rule_layout=False,
+        kv=empty,
+    )
+    assert not ci._commercial_detail_needs_llm_fallback(
+        is_commercial=True,
+        known_company=ci.KnownInsuranceCompany.PING_AN,
+        has_rule_layout=True,
+        kv=full,
+    )
+    assert not ci._commercial_detail_needs_llm_fallback(
+        is_commercial=False,
+        known_company=ci.KnownInsuranceCompany.BO_HAI,
+        has_rule_layout=False,
+        kv=empty,
+    )
+
+
+def test_commercial_detail_generic_header_context_from_top_anchors() -> None:
+    word_items = [
+        (0, 1, 10.0, 72.0, 30.0, 78.0, "太高", 1, 1, 1),
+        (0, 2, 10.0, 82.0, 30.0, 88.0, "承保险种", 1, 2, 1),
+        (0, 3, 80.0, 83.0, 100.0, 89.0, "保额", 1, 2, 2),
+        (0, 4, 120.0, 84.0, 140.0, 90.0, "保费", 1, 2, 3),
+        (0, 5, 10.0, 103.0, 70.0, 109.0, "新能源汽车损失保险", 2, 1, 1),
+        (1, 1, 10.0, 10.0, 30.0, 16.0, "第二页", 1, 1, 1),
+    ]
+    anchors = [
+        (0, 10.0, 100.0, 70.0, 110.0, "新能源汽车损失保险"),
+        (0, 10.0, 130.0, 70.0, 140.0, "新能源汽车第三者责任保险"),
+    ]
+
+    got = ci._commercial_detail_generic_header_context_from_top_anchors(
+        word_items,
+        anchors,
+    )
+
+    assert "承保险种" in got
+    assert "保额" in got
+    assert "保费" in got
+    assert "太高" not in got
+    assert "新能源汽车损失保险" not in got
+    assert "第二页" not in got
+
+
+def test_commercial_detail_llm_band_requires_majority_ref_y_overlap() -> None:
+    words = [
+        (0, 1, 10.0, 383.8, 60.0, 393.1, "上一行", 1, 1, 1),
+        (0, 2, 10.0, 395.2, 60.0, 404.4, "当前行", 1, 2, 1),
+        (0, 3, 10.0, 406.5, 60.0, 415.8, "下一行", 1, 3, 1),
+        (0, 4, 10.0, 402.0, 60.0, 410.0, "重叠不足", 1, 4, 1),
+        (0, 5, 10.0, 397.0, 60.0, 403.0, "重叠充足", 1, 5, 1),
+    ]
+
+    got = ci._commercial_build_detail_llm_band_words(
+        words,
+        page_index=0,
+        ref_y0=395.2,
+        ref_y1=404.4,
+        pad_pt=6.0,
+    )
+
+    texts = [row[5] for row in got]
+    assert texts == ["当前行", "重叠充足"]
+
+
+def test_commercial_detail_llm_band_sorts_same_row_left_to_right() -> None:
+    words = [
+        (0, 1, 360.0, 356.8, 410.0, 369.2, "1500000.00", 1, 1, 1),
+        (0, 2, 513.0, 357.3, 545.0, 369.7, "1976.90", 1, 1, 2),
+        (0, 3, 119.0, 359.0, 227.0, 368.0, "新能源汽车第三者责任保险", 1, 1, 3),
+    ]
+
+    got = ci._commercial_build_detail_llm_band_words(
+        words,
+        page_index=0,
+        ref_y0=359.0,
+        ref_y1=368.0,
+        pad_pt=6.0,
+    )
+
+    assert [row[5] for row in got] == [
+        "新能源汽车第三者责任保险",
+        "1500000.00",
+        "1976.90",
+    ]
+
+
 def test_run_car_insurance_commercial_detail_table_passes_taikang_layout() -> None:
     """泰康在线：label 后第 2 项保额、第 4 项保费（下标 1 与 3）。"""
     blocks = [
@@ -773,6 +910,11 @@ def test_run_car_insurance_ping_an_premium_detail_passes_pymupdf_like_blocks() -
 def test_aggregate_pass2_deductibles_all_zero() -> None:
     assert _aggregate_pass2_deductibles_from_llm_strings(["0", "/", "0.00"]) == "0"
     assert _aggregate_pass2_deductibles_from_llm_strings(["", "/", "-"]) is None
+
+
+def test_commercial_detail_llm_not_found_marker_returns_empty() -> None:
+    assert ci._commercial_detail_llm_field_value("__NOT_FOUND__") == ""
+    assert ci._commercial_detail_llm_field_value(" 1200.00 ") == "1200.00"
 
 
 def test_aggregate_pass2_deductibles_max_nonzero() -> None:

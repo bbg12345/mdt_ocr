@@ -254,6 +254,7 @@ _INSURER_DOUBAO_ENV_API_KEY = "CAR_INSURANCE_DOUBAO_API_KEY"
 _INSURER_DOUBAO_ENV_MODEL = "CAR_INSURANCE_DOUBAO_MODEL"
 # 方舟 Chat Completions OpenAI 兼容字段：仅输出 JSON（提示词中须出现 “JSON” 字样）
 _DOUBAO_RESPONSE_FORMAT_JSON_OBJECT = {"type": "json_object"}
+_SCALAR_LLM_NOT_FOUND: Final[str] = "__NOT_FOUND__"
 
 # 车险模块内全部方舟/豆包 HTTP 共用线程池（与 FastAPI 侧 ``ocr_service`` 的 OCR 总池分离，避免同池嵌套 submit 死锁）
 _CAR_INSURANCE_LLM_ENV_POOL_SIZE = "CAR_INSURANCE_LLM_THREAD_POOL_SIZE"
@@ -468,6 +469,169 @@ def _doubao_infer_insurer_name(context_block: str) -> Optional[str]:
     lines = content.splitlines()
     first = (lines[0].strip() if lines else "").strip("`\"“” ")
     return first if first else None
+
+
+def _build_first_page_word_context_lines(
+    word_rect_items: Sequence[PymupdfWordRectItem],
+    *,
+    max_chars: int = _INSURER_DOUBAO_CONTEXT_MAX_CHARS,
+) -> str:
+    rows: List[str] = []
+    for pi, wi, x0, y0, x1, y1, txt, bn, ln, wn in word_rect_items:
+        if pi != 0:
+            continue
+        rows.append(
+            f"page_index={pi}\tword_index={wi}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
+            f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\tblock_no={pymupdf_prompt_meta_str(bn)}\t"
+            f"line_no={pymupdf_prompt_meta_str(ln)}\tword_no={pymupdf_prompt_meta_str(wn)}\t"
+            f"{format_pymupdf_block_text_like_cluster_script(txt)}"
+        )
+    blob = "\n".join(rows)
+    if len(blob) <= max_chars:
+        return blob
+    return blob[: max_chars - 80] + "\n…(截断)"
+
+
+def _scalar_llm_field_value(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if value == _SCALAR_LLM_NOT_FOUND:
+        return ""
+    return value
+
+
+def _doubao_infer_scalar_fields_from_first_page_words(
+    context_block: str,
+    *,
+    need_sign_date: bool,
+    need_premium_total: bool,
+    need_period: bool,
+) -> Optional[Dict[str, str]]:
+    api_key = os.environ.get(_INSURER_DOUBAO_ENV_API_KEY, "").strip()
+    model = os.environ.get(_INSURER_DOUBAO_ENV_MODEL, "").strip()
+    chat_url = f"{_INSURER_DOUBAO_API_BASE.rstrip('/')}/chat/completions"
+    if not api_key or not model:
+        return None
+    if not (need_sign_date or need_premium_total or need_period):
+        return None
+
+    field_lines = [
+        f'签单日期：{"需要识别" if need_sign_date else "已有值，不要识别，返回 " + _SCALAR_LLM_NOT_FOUND}',
+        f'保险费合计：{"需要识别" if need_premium_total else "已有值，不要识别，返回 " + _SCALAR_LLM_NOT_FOUND}',
+        f'保险期间：{"需要识别" if need_period else "已有值，不要识别，start/end 均返回 " + _SCALAR_LLM_NOT_FOUND}',
+    ]
+    system_prompt = (
+        "你是车险保单 OCR 版面辅助解析器。用户会给出第一页 PyMuPDF get_text(\"words\") 的 word 级 bbox。"
+        "你只抽取被标记为“需要识别”的字段；标记为已有值的字段不要重新识别。"
+        "字段规则：签单日期为保单签发/签单日期；保险费合计为全单总保费金额，不是单项保费；"
+        "保险期间为保险责任起止时间，分别输出 start/end。"
+        "日期时间尽量输出原文可对应的完整日期时间；金额只输出金额字符串。"
+        "你必须只根据原文抽取，禁止编造。"
+        "你必须只输出一个合法 JSON 对象（UTF-8），不要 markdown、不要解释。"
+        '根对象有且仅有一个键 "result"，值为对象；对象必须包含 sign_date、premium_total、period_start、period_end 四个字符串键。'
+        f'任何无法确定或不需要识别的字段，必须输出 "{_SCALAR_LLM_NOT_FOUND}"。'
+        f'示例：{{"result":{{"sign_date":"2025年5月18日","premium_total":"1234.56",'
+        f'"period_start":"2025年5月19日00:00","period_end":"2026年5月18日24:00"}}}}。'
+    )
+    user_content = (
+        "字段识别需求：\n"
+        + "\n".join(field_lines)
+        + "\n\n以下为第一页 PyMuPDF word bbox：\n\n"
+        + context_block
+    )
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "response_format": _DOUBAO_RESPONSE_FORMAT_JSON_OBJECT,
+    }
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        chat_url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except (URLError, OSError):
+        return None
+
+    try:
+        data = json.loads(raw)
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+    except (json.JSONDecodeError, IndexError, TypeError, AttributeError):
+        return None
+
+    obj = _commercial_parse_llm_json_object(content)
+    if not obj:
+        return None
+    inner = obj.get("result")
+    row: Dict[str, Any] = inner if isinstance(inner, dict) else obj
+    return {
+        "sign_date": _scalar_llm_field_value(row.get("sign_date", "")),
+        "premium_total": _scalar_llm_field_value(row.get("premium_total", "")),
+        "period_start": _scalar_llm_field_value(row.get("period_start", "")),
+        "period_end": _scalar_llm_field_value(row.get("period_end", "")),
+    }
+
+
+def _normalize_scalar_llm_result(row: Dict[str, str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    sign_date = _scalar_llm_field_value(row.get("sign_date", ""))
+    if sign_date:
+        iso = _convert_to_iso_format(sign_date)
+        if iso:
+            out["签单日期"] = iso
+    premium_total = _scalar_llm_field_value(row.get("premium_total", ""))
+    if premium_total:
+        amount = _commercial_parse_money_amount(premium_total)
+        if amount is not None:
+            out["保险费合计"] = amount
+    start_raw = _scalar_llm_field_value(row.get("period_start", ""))
+    end_raw = _scalar_llm_field_value(row.get("period_end", ""))
+    if start_raw and end_raw:
+        start_iso = _convert_to_iso_format(start_raw)
+        end_iso = _convert_to_iso_format(end_raw)
+        if start_iso and end_iso:
+            out["保险期间"] = {"start": start_iso, "end": end_iso}
+    return out
+
+
+def run_car_insurance_scalar_llm_fallback(
+    *,
+    word_rect_items: Sequence[PymupdfWordRectItem],
+    need_sign_date: bool,
+    need_premium_total: bool,
+    need_period: bool,
+) -> Dict[str, Any]:
+    if not (need_sign_date or need_premium_total or need_period):
+        return {}
+    ctx = _build_first_page_word_context_lines(word_rect_items)
+    if not ctx:
+        return {}
+    raw = _run_car_insurance_llm_in_pool(
+        _doubao_infer_scalar_fields_from_first_page_words,
+        ctx,
+        need_sign_date=need_sign_date,
+        need_premium_total=need_premium_total,
+        need_period=need_period,
+    )
+    if not raw:
+        return {}
+    return _normalize_scalar_llm_result(raw)
 
 
 def _pass5_insurer_name_doubao_llm(
@@ -2477,6 +2641,22 @@ def _merge_commercial_detail_table_kv(
     }
 
 
+def _commercial_detail_needs_llm_fallback(
+    *,
+    is_commercial: bool,
+    known_company: Optional[KnownInsuranceCompany],
+    has_rule_layout: bool,
+    kv: Dict[str, Any],
+) -> bool:
+    if not is_commercial:
+        return False
+    if known_company is None:
+        return True
+    if not has_rule_layout:
+        return True
+    return any(not (kv.get(k) or "") for k in _CAR_INSURANCE_COMMERCIAL_ONLY_KV_KEYS)
+
+
 def run_car_insurance_commercial_detail_table_passes(
     blocks: Sequence[str],
     *,
@@ -2594,17 +2774,13 @@ def run_car_insurance_commercial_detail_table_passes(
     return out
 
 
-# 商业险明细 pass2（豆包）：渤海 / 中银 / 华安（阳光仅规则 pass1，不走 pass2）；PyMuPDF 纵带 + LLM 按行抽取
-_COMMERCIAL_DETAIL_PASS2_LLM_INSURERS: frozenset[KnownInsuranceCompany] = frozenset(
-    {
-        KnownInsuranceCompany.BO_HAI,
-        KnownInsuranceCompany.ZHONG_YIN,
-        KnownInsuranceCompany.HUA_AN,
-    }
-)
+# 商业险明细 pass2（豆包）：通用 fallback；PyMuPDF block 锚点 + word 纵带上下文按行抽取。
 # 费用明细 pass2：锚点 block 的 y0/y1 向上下各扩展此值（pt），与 ``_in_vertical_band`` 筛同页 words。
-_COMMERCIAL_DETAIL_LLM_Y_PAD_PT: Final[float] = 20.0
+_COMMERCIAL_DETAIL_LLM_Y_PAD_PT: Final[float] = 6.0
 _COMMERCIAL_DETAIL_LLM_CONTEXT_MAX_CHARS: Final[int] = 12000
+_COMMERCIAL_DETAIL_LLM_NOT_FOUND: Final[str] = "__NOT_FOUND__"
+_COMMERCIAL_DETAIL_WORD_MAX_HEIGHT_PT: Final[float] = 50.0
+_COMMERCIAL_DETAIL_MIN_REF_Y_OVERLAP_RATIO: Final[float] = 0.5
 # pass2 仅使用 PDF 前两页（0-based 下标 0、1）的 ``blocks``/``words``，避免后续页条款/说明误命中。
 _COMMERCIAL_DETAIL_PASS2_MAX_PAGE_INDEX: Final[int] = 1
 # 明细 pass2 调豆包前：在锚点 block 同行邻域（纵带 + 水平窗）内用正则预筛；无金额/乘客形态则跳过 HTTP。
@@ -2748,7 +2924,7 @@ class CommercialPass2TableHeaderExtractSpec:
     max_page_index: int
     extract_source: Literal["blocks", "words"] = "words"
     sort_mode: Literal["document_order", "column_rank_then_geom"] = "document_order"
-    #: ``words`` 源表头附录行格式；明细 pass2 保司统一用 ``bbox_column_text`` 省略词序号与块内行号字段。
+    #: ``words`` 源表头附录行格式；明细 pass2 保司统一用 ``bbox_column_text`` 仅保留横坐标与文本。
     words_line_format: Literal["pymupdf_meta", "bbox_column_text"] = "pymupdf_meta"
 
     def extract_table_lines(self, pdf_bytes: bytes) -> str:
@@ -2790,6 +2966,7 @@ def _extract_table_lines_from_precomputed_items(
     *,
     block_rect_items: Sequence[PymupdfBlockRectItem],
     word_rect_items: Sequence[PymupdfWordRectItem],
+    max_y0_by_page: Optional[Dict[int, float]] = None,
 ) -> str:
     pairs = _extract_table_header_column_pairs_local(
         table_header_spec.header_texts_in_column_order,
@@ -2811,6 +2988,8 @@ def _extract_table_lines_from_precomputed_items(
         for pi, x0, y0, x1, y1, text in block_rect_items:
             if pi > table_header_spec.max_page_index:
                 continue
+            if max_y0_by_page is not None and y0 > max_y0_by_page.get(pi, -float("inf")):
+                continue
             page_counts[pi] = page_counts.get(pi, 0) + 1
             if excluded(text) or not matched(text):
                 continue
@@ -2828,6 +3007,8 @@ def _extract_table_lines_from_precomputed_items(
     for pi, wi, x0, y0, x1, y1, text, bn, ln, wn in word_rect_items:
         if pi > table_header_spec.max_page_index:
             continue
+        if max_y0_by_page is not None and y0 > max_y0_by_page.get(pi, -float("inf")):
+            continue
         if excluded(text) or not matched(text):
             continue
         rank = _table_item_matched_min_column_local(text, pairs)
@@ -2840,8 +3021,7 @@ def _extract_table_lines_from_precomputed_items(
         tcell = format_pymupdf_block_text_like_cluster_script(text)
         if table_header_spec.words_line_format == "bbox_column_text":
             lines.append(
-                f"page_index={pi}\tcolumn_index={rank}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
-                f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\t{tcell}"
+                f"x0={x0:.1f}\tx1={x1:.1f}\t{tcell}"
             )
         else:
             lines.append(
@@ -2878,6 +3058,15 @@ _COMMERCIAL_PASS2_TABLE_HEADER_SPEC_BY_COMPANY: Final[
     co: _commercial_pass2_table_header_spec_from_cfg(cfg)
     for co, cfg in _COMMERCIAL_PASS2_PASS2_TABLE_CFG_BY_COMPANY.items()
 }
+_COMMERCIAL_DETAIL_GENERIC_HEADER_UP_PAD_PT: Final[float] = 20.0
+
+
+def _commercial_detail_word_height_ok(
+    item: PymupdfWordRectItem,
+    *,
+    max_height_pt: float = _COMMERCIAL_DETAIL_WORD_MAX_HEIGHT_PT,
+) -> bool:
+    return (item[5] - item[3]) <= max_height_pt
 
 
 def commercial_pass2_build_user_prompt_with_extract_table(
@@ -2956,9 +3145,28 @@ def _commercial_build_detail_llm_band_words(
             continue
         if not _in_vertical_band(y0, y1, ref_y0, ref_y1, pad_pt):
             continue
+        if not _commercial_detail_bbox_overlaps_ref_y_enough(y0, y1, ref_y0, ref_y1):
+            continue
         rows.append((wi, x0, y0, x1, y1, text, bn, ln, wn))
-    rows.sort(key=lambda t: (t[2], t[1]))
+    rows.sort(key=lambda t: (t[1], t[2]))
     return rows
+
+
+def _commercial_detail_bbox_overlaps_ref_y_enough(
+    cand_y0: float,
+    cand_y1: float,
+    ref_y0: float,
+    ref_y1: float,
+    *,
+    min_ratio: float = _COMMERCIAL_DETAIL_MIN_REF_Y_OVERLAP_RATIO,
+) -> bool:
+    cand_h = cand_y1 - cand_y0
+    if cand_h <= 0:
+        return False
+    overlap = min(cand_y1, ref_y1) - max(cand_y0, ref_y0)
+    if overlap <= 0:
+        return False
+    return (overlap / cand_h) > min_ratio
 
 
 def _commercial_detail_llm_context_from_word_rows(
@@ -2969,9 +3177,7 @@ def _commercial_detail_llm_context_from_word_rows(
 ) -> str:
     """每行格式对齐 ``cluster_policy_blocks_by_grid_lines`` 第四节（页码/词序号/bbox/meta/文本）。"""
     lines = [
-        f"page_index={page_index}\tword_index={wi}\tx0_pt={x0:.1f}\ty0_pt={y0:.1f}\t"
-        f"x1_pt={x1:.1f}\ty1_pt={y1:.1f}\tblock_no={pymupdf_prompt_meta_str(bn)}\t"
-        f"line_no={pymupdf_prompt_meta_str(ln)}\tword_no={pymupdf_prompt_meta_str(wn)}\t"
+        f"x0={x0:.1f}\ty0={y0:.1f}\tx1={x1:.1f}\ty1={y1:.1f}\t"
         f"{format_pymupdf_block_text_like_cluster_script(txt)}"
         for wi, x0, y0, x1, y1, txt, bn, ln, wn in rows
     ]
@@ -2979,6 +3185,32 @@ def _commercial_detail_llm_context_from_word_rows(
     if len(blob) <= max_chars:
         return blob
     return blob[: max_chars - 80] + "\n…(截断)"
+
+
+def _commercial_detail_generic_header_context_from_top_anchors(
+    word_items: Sequence[PymupdfWordRectItem],
+    anchor_items: Sequence[PymupdfBlockRectItem],
+    *,
+    up_pad_pt: float = _COMMERCIAL_DETAIL_GENERIC_HEADER_UP_PAD_PT,
+) -> str:
+    if not anchor_items:
+        return ""
+    top_page = min(row[0] for row in anchor_items)
+    top_page_anchors = [row for row in anchor_items if row[0] == top_page]
+    if not top_page_anchors:
+        return ""
+    top_y0 = min(row[2] for row in top_page_anchors)
+    lo = top_y0 - up_pad_pt
+    hi = top_y0
+    rows: List[Tuple[int, float, float, float, float, str, int, int, int]] = []
+    for pi, wi, x0, y0, x1, y1, text, bn, ln, wn in word_items:
+        if pi != top_page:
+            continue
+        if y1 < lo or y0 > hi:
+            continue
+        rows.append((wi, x0, y0, x1, y1, text, bn, ln, wn))
+    rows.sort(key=lambda t: (t[2], t[1]))
+    return _commercial_detail_llm_context_from_word_rows(top_page, rows)
 
 
 def _commercial_parse_llm_json_object(content: str) -> Optional[Dict[str, Any]]:
@@ -2999,6 +3231,13 @@ def _commercial_parse_llm_json_object(content: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def _commercial_detail_llm_field_value(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if value == _COMMERCIAL_DETAIL_LLM_NOT_FOUND:
+        return ""
+    return value
 
 
 def _aggregate_pass2_deductibles_from_llm_strings(raws: Sequence[str]) -> Optional[str]:
@@ -3027,14 +3266,29 @@ def _aggregate_pass2_deductibles_from_llm_strings(raws: Sequence[str]) -> Option
 
 
 def _commercial_detail_pass2_layout_instruction(
-    company: KnownInsuranceCompany,
+    company: Optional[KnownInsuranceCompany],
     *,
     row_label: str,
+    company_name: str = "",
 ) -> str:
     """各保司列序说明；表头 ``extract_table`` 行块由 ``compose_table_llm_user_prompt`` 另接（与配置一致）。"""
-    cfg = _COMMERCIAL_PASS2_PASS2_TABLE_CFG_BY_COMPANY.get(company)
+    cfg = _COMMERCIAL_PASS2_PASS2_TABLE_CFG_BY_COMPANY.get(company) if company is not None else None
     if cfg is None:
-        return ""
+        company_display = company_name.strip() or (company.value if company is not None else "某保险公司")
+        return "\n".join(
+            [
+                f"本保单为{company_display}承保险种明细。",
+                (
+                    f"当前险种「{row_label}」。只抽取和当前险种「{row_label}」同一行的保额/保险金额/责任限额"
+                    "以及保费/保险费。"
+                ),
+                (
+                    "通常承保险种在左侧列，保额/保险金额/责任限额在中间金额列，保费/保险费在右侧金额列。"
+                    "不要把费率、免赔率、税额、合计金额、其它险种行的金额当作当前险种结果。"
+                ),
+                "同一行指纵坐标范围相同或很接近（纵带内各词条 y0、y1 相近即视为同一表格行）。",
+            ]
+        )
     key_h = cfg.header_text_for_column(cfg.key_column_index)
     col_order_desc = " ".join(
         f"第{c}列「{t}」"
@@ -3059,7 +3313,8 @@ def _commercial_detail_pass2_layout_instruction(
 
 def _doubao_infer_commercial_detail_row(
     *,
-    company: KnownInsuranceCompany,
+    company: Optional[KnownInsuranceCompany],
+    company_name: str = "",
     row_label: str,
     k_cov: str,
     k_prem: str,
@@ -3076,12 +3331,18 @@ def _doubao_infer_commercial_detail_row(
     if not api_key or not model:
         return None
 
-    layout = _commercial_detail_pass2_layout_instruction(company, row_label=row_label)
+    layout = _commercial_detail_pass2_layout_instruction(
+        company,
+        row_label=row_label,
+        company_name=company_name,
+    )
     ded_line = ""
     if collect_deductible:
-        ded_line = '字段 "deductible"：该行免赔额；原文无金额、为 /、或无法确定时一律 ""。'
+        ded_line = (
+            f'字段 "deductible"：该行免赔额；原文无金额、为 /、或无法确定时一律 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"。'
+        )
     else:
-        ded_line = '字段 "deductible"：无单独免赔列时固定输出 ""。'
+        ded_line = f'字段 "deductible"：无单独免赔列时固定输出 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"。'
 
     passenger_cov_hint = ""
     if (
@@ -3096,14 +3357,15 @@ def _doubao_infer_commercial_detail_row(
 
     if company in _COMMERCIAL_PASS2_PASS2_TABLE_CFG_BY_COMPANY:
         user_ctx_line_desc = (
-            "用户消息含两部分：其一为从 PDF 前几页筛出的表头相关词条若干行（每行仅 page_index、column_index、"
-            "轴对齐 bbox 与文本）；其二为锚点纵带内 PyMuPDF ``get_text(\"words\")`` 词条，"
-            "每行含 page_index、word_index、轴对齐 bbox、block_no、line_no、word_no 与文本。"
+            "用户消息含两部分：其一为从 PDF 前几页筛出的表头相关词条若干行（每行仅横坐标 x0/x1 与文本）；"
+            "其二为当前险种行附近的文字项，每行含轴对齐 bbox 坐标 x0/y0/x1/y1 与文本。"
+            "坐标单位为 pt，x0/x1 分别为文字框左/右边界，y0/y1 分别为文字框上/下边界。"
         )
     else:
         user_ctx_line_desc = (
-            "用户给出同一纵带内若干 PyMuPDF ``get_text(\"words\")`` 词条"
-            "（每行含 page_index、word_index、轴对齐 bbox x0_pt–y1_pt、block_no、line_no、word_no 与文本）。"
+            "用户给出当前险种行附近的若干文字项"
+            "（每行含轴对齐 bbox 坐标 x0/y0/x1/y1 与文本）。"
+            "坐标单位为 pt，x0/x1 分别为文字框左/右边界，y0/y1 分别为文字框上/下边界。"
         )
     system_prompt = (
         "你是车险商业险承保险种明细表抽取助手。"
@@ -3114,8 +3376,12 @@ def _doubao_infer_commercial_detail_row(
         "coverage 为保额原文中的金额（可含千分位、小数、元/万元等，与单元格一致即可）；"
         "premium 为保费金额字符串；"
         + ded_line
-        + "无法从原文确定时对应键输出空字符串。"
-        '示例：{"result":{"coverage":"500000.00","premium":"1200.00","deductible":""}}。'
+        + f'coverage 或 premium 无法从原文确定时，对应键必须输出 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"；'
+        + f'工程侧会把 "{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}" 识别为未命中并返回空字符串。'
+        + (
+            f'示例：{{"result":{{"coverage":"500000.00","premium":"1200.00",'
+            f'"deductible":"{_COMMERCIAL_DETAIL_LLM_NOT_FOUND}"}}}}。'
+        )
         + passenger_cov_hint
     )
     user_content = commercial_pass2_build_user_prompt_with_extract_table(
@@ -3169,9 +3435,9 @@ def _doubao_infer_commercial_detail_row(
     inner = obj.get("result")
     data_row: Dict[str, Any] = inner if isinstance(inner, dict) else obj
     out = {
-        "coverage": str(data_row.get("coverage", "") or "").strip(),
-        "premium": str(data_row.get("premium", "") or "").strip(),
-        "deductible": str(data_row.get("deductible", "") or "").strip(),
+        "coverage": _commercial_detail_llm_field_value(data_row.get("coverage", "")),
+        "premium": _commercial_detail_llm_field_value(data_row.get("premium", "")),
+        "deductible": _commercial_detail_llm_field_value(data_row.get("deductible", "")),
     }
     return out
 
@@ -3268,11 +3534,12 @@ def _commercial_pass2_neighbor_blob_suggests_detail_llm(blob: str) -> bool:
 def _commercial_pass2_doubao_single_lab(
     lab: str,
     jobs: List[Tuple[int, str]],
-    company: KnownInsuranceCompany,
+    company: Optional[KnownInsuranceCompany],
     *,
     engine_label: str,
     collect_ded: bool,
     block_items: Sequence[Tuple[int, float, float, float, float, str]],
+    company_name: str = "",
     precomputed_table_header_lines: Optional[str] = None,
     table_header_spec: Optional[CommercialPass2TableHeaderExtractSpec] = None,
     table_header_section_preamble: str = "",
@@ -3318,6 +3585,7 @@ def _commercial_pass2_doubao_single_lab(
         try:
             llm_row = _doubao_infer_commercial_detail_row(
                 company=company,
+                company_name=company_name,
                 row_label=lab,
                 k_cov=k_cov,
                 k_prem=k_prem,
@@ -3385,9 +3653,10 @@ def _commercial_pass2_doubao_single_lab(
 
 
 def run_car_insurance_commercial_detail_pass2_doubao(
-    company: KnownInsuranceCompany,
+    company: Optional[KnownInsuranceCompany],
     *,
     engine_label: str,
+    company_name: str = "",
     block_rect_items: Optional[Sequence[PymupdfBlockRectItem]] = None,
     word_rect_items: Optional[Sequence[PymupdfWordRectItem]] = None,
 ) -> Dict[str, str]:
@@ -3426,38 +3695,60 @@ def run_car_insurance_commercial_detail_pass2_doubao(
         row
         for row in words_all
         if row[0] <= _COMMERCIAL_DETAIL_PASS2_MAX_PAGE_INDEX
+        and _commercial_detail_word_height_ok(row)
     ]
-
-    precomputed_table_header_lines: Optional[str] = None
-    table_header_spec: Optional[CommercialPass2TableHeaderExtractSpec] = None
-    table_header_section_preamble: str = ""
-    table_header_spec = _COMMERCIAL_PASS2_TABLE_HEADER_SPEC_BY_COMPANY.get(company)
-    if table_header_spec is not None:
-        precomputed_table_header_lines = _extract_table_lines_from_precomputed_items(
-            table_header_spec,
-            block_rect_items=block_items,
-            word_rect_items=word_items,
-        )
-        table_header_section_preamble = build_extract_table_words_header_section_preamble(
-            table_header_spec.header_texts_in_column_order,
-            table_header_spec.column_indices,
-            words_line_format=table_header_spec.words_line_format,
-        )
 
     anchors = _commercial_pass2_anchor_labels()
     seen_flat: Set[int] = set()
-    lab_order: List[str] = []
-    lab_jobs: Dict[str, List[Tuple[int, str]]] = {}
-
-    for fi, (pi, x0, y0, x1, y1, text) in enumerate(block_items):
+    matched_anchor_rows: List[Tuple[int, PymupdfBlockRectItem, str]] = []
+    for fi, row in enumerate(block_items):
         if fi in seen_flat:
             continue
+        pi, x0, y0, x1, y1, text = row
         lab = _commercial_longest_pass2_anchor_label(text, anchors)
         if lab is None:
             continue
         seen_flat.add(fi)
         if lab not in _COMMERCIAL_DETAIL_LABEL_TO_COVERAGE_PREMIUM_KV:
             continue
+        matched_anchor_rows.append((fi, row, lab))
+
+    precomputed_table_header_lines: Optional[str] = None
+    table_header_spec = _COMMERCIAL_PASS2_TABLE_HEADER_SPEC_BY_COMPANY.get(company)
+    table_header_section_preamble: str = ""
+    if table_header_spec is not None:
+        header_max_y0_by_page: Dict[int, float] = {}
+        for _fi, row, _lab in matched_anchor_rows:
+            pi = row[0]
+            y0 = row[2]
+            old = header_max_y0_by_page.get(pi)
+            if old is None or y0 < old:
+                header_max_y0_by_page[pi] = y0
+        precomputed_table_header_lines = _extract_table_lines_from_precomputed_items(
+            table_header_spec,
+            block_rect_items=block_items,
+            word_rect_items=word_items,
+            max_y0_by_page=header_max_y0_by_page,
+        )
+        table_header_section_preamble = build_extract_table_words_header_section_preamble(
+            table_header_spec.header_texts_in_column_order,
+            table_header_spec.column_indices,
+            words_line_format=table_header_spec.words_line_format,
+        )
+    else:
+        precomputed_table_header_lines = _commercial_detail_generic_header_context_from_top_anchors(
+            word_items,
+            [row for _fi, row, _lab in matched_anchor_rows],
+        )
+        table_header_section_preamble = (
+            "下列词条为从所有已识别商业险明细 key 中最上方 key 的上方 20pt 区域收集的 "
+            "文字 bbox，用作通用表头/列对齐参考："
+        )
+
+    lab_order: List[str] = []
+    lab_jobs: Dict[str, List[Tuple[int, str]]] = {}
+
+    for fi, (pi, x0, y0, x1, y1, text), lab in matched_anchor_rows:
         k_cov, k_prem = _COMMERCIAL_DETAIL_LABEL_TO_COVERAGE_PREMIUM_KV[lab]
         band = _commercial_build_detail_llm_band_words(
             word_items,
@@ -3483,6 +3774,7 @@ def run_car_insurance_commercial_detail_pass2_doubao(
             engine_label=engine_label,
             collect_ded=collect_ded,
             block_items=block_items,
+            company_name=company_name,
             precomputed_table_header_lines=precomputed_table_header_lines,
             table_header_spec=table_header_spec,
             table_header_section_preamble=table_header_section_preamble,
@@ -3927,6 +4219,37 @@ def car_insurance_extract(
         word_rect_items=word_rect_items,
         defer_bbox_llm=defer_mu_bbox_llm,
     )
+    merged_name = _merge_insurer_display_prefer_longer(
+        r_mu.get("保险公司名称"),
+        r_pdf.get("保险公司名称"),
+    )
+    merged_enum: Optional[KnownInsuranceCompany] = (
+        r_mu.get("known_company") or r_pdf.get("known_company")
+    )
+    if merged_enum is None and merged_name:
+        merged_enum = _pass4_enum_for_hit(merged_name)
+
+    if is_commercial and _commercial_insurer_must_run_doubao_overlay(
+        insurer_name=merged_name,
+        known_company=merged_enum,
+        blocks_pdf=blocks_pdf,
+        blocks_mu=blocks_mu,
+    ):
+        ol = _pass5_insurer_name_doubao_llm(
+            engine_label="commercial_ping_an_hua_an",
+            anchor_fallback=True,
+            block_rect_items=block_rect_items,
+            word_rect_items=word_rect_items,
+        )
+        ol = _pass3_filter_insurer_name(
+            ol,
+            from_pass=5,
+            engine_label="commercial_ping_an_hua_an",
+        )
+        if ol is not None:
+            merged_name = ol
+            merged_enum = _pass4_enum_for_hit(ol)
+
     insured_pdf = run_car_insurance_insured_passes(page_texts_pdf, engine_label="pypdf")
     insured_mu = run_car_insurance_insured_passes(blocks_mu, engine_label="pymupdf")
     license_plate_pdf = run_car_insurance_license_plate_passes(page_texts_pdf, engine_label="pypdf")
@@ -3962,37 +4285,6 @@ def car_insurance_extract(
         word_rect_items=word_rect_items,
     )
 
-    merged_name = _merge_insurer_display_prefer_longer(
-        r_mu.get("保险公司名称"),
-        r_pdf.get("保险公司名称"),
-    )
-    merged_enum: Optional[KnownInsuranceCompany] = (
-        r_mu.get("known_company") or r_pdf.get("known_company")
-    )
-    if merged_enum is None and merged_name:
-        merged_enum = _pass4_enum_for_hit(merged_name)
-
-    if is_commercial and _commercial_insurer_must_run_doubao_overlay(
-        insurer_name=merged_name,
-        known_company=merged_enum,
-        blocks_pdf=blocks_pdf,
-        blocks_mu=blocks_mu,
-    ):
-        ol = _pass5_insurer_name_doubao_llm(
-            engine_label="commercial_ping_an_hua_an",
-            anchor_fallback=True,
-            block_rect_items=block_rect_items,
-            word_rect_items=word_rect_items,
-        )
-        ol = _pass3_filter_insurer_name(
-            ol,
-            from_pass=5,
-            engine_label="commercial_ping_an_hua_an",
-        )
-        if ol is not None:
-            merged_name = ol
-            merged_enum = _pass4_enum_for_hit(ol)
-
     kv = _car_insurance_empty_kv(policy_type)
     kv["保险公司名称"] = merged_name or ""
     kv["被保险人"] = (insured_mu.get("被保险人") or insured_pdf.get("被保险人")) or ""
@@ -4021,6 +4313,23 @@ def car_insurance_extract(
             kv["保险期间"] = ""
             logger.debug("bbox回退逻辑也未提取到保险期间")
 
+    need_scalar_sign_date = not (kv.get("签单日期") or "")
+    need_scalar_premium_total = not (kv.get("保险费合计") or "")
+    need_scalar_period = not (kv.get("保险期间") or "")
+    if need_scalar_sign_date or need_scalar_premium_total or need_scalar_period:
+        scalar_llm = run_car_insurance_scalar_llm_fallback(
+            word_rect_items=word_rect_items,
+            need_sign_date=need_scalar_sign_date,
+            need_premium_total=need_scalar_premium_total,
+            need_period=need_scalar_period,
+        )
+        if need_scalar_sign_date and scalar_llm.get("签单日期"):
+            kv["签单日期"] = scalar_llm["签单日期"]
+        if need_scalar_premium_total and scalar_llm.get("保险费合计"):
+            kv["保险费合计"] = scalar_llm["保险费合计"]
+        if need_scalar_period and scalar_llm.get("保险期间"):
+            kv["保险期间"] = scalar_llm["保险期间"]
+
     _commercial_detail_layout: Dict[KnownInsuranceCompany, CommercialDetailTableLayout] = {
         KnownInsuranceCompany.PING_AN: "PING_AN",
         KnownInsuranceCompany.PICC_P: "PICC_P",
@@ -4029,7 +4338,8 @@ def car_insurance_extract(
         KnownInsuranceCompany.CPIC_P: "PACIFIC_P",
         KnownInsuranceCompany.YANG_GUANG: "YANG_GUANG_P",
     }
-    if is_commercial and merged_enum in _commercial_detail_layout:
+    has_commercial_detail_rule_layout = is_commercial and merged_enum in _commercial_detail_layout
+    if has_commercial_detail_rule_layout:
         _dl = _commercial_detail_layout[merged_enum]
         detail_mu = run_car_insurance_commercial_detail_table_passes(
             blocks_mu,
@@ -4063,10 +4373,16 @@ def car_insurance_extract(
         if ded:
             kv["免赔额"] = ded
 
-    if is_commercial and merged_enum in _COMMERCIAL_DETAIL_PASS2_LLM_INSURERS:
+    if _commercial_detail_needs_llm_fallback(
+        is_commercial=is_commercial,
+        known_company=merged_enum,
+        has_rule_layout=has_commercial_detail_rule_layout,
+        kv=kv,
+    ):
         detail_p2 = run_car_insurance_commercial_detail_pass2_doubao(
             merged_enum,
             engine_label="pymupdf",
+            company_name=merged_name or "",
             block_rect_items=block_rect_items,
             word_rect_items=word_rect_items,
         )
